@@ -7,6 +7,17 @@ const envSchema = z.object({
     .default('development'),
   PORT: z.coerce.number().int().positive().default(3000),
   DATABASE_URL: z.string().url(),
+  SMTP_HOST: z.string().min(1).default('localhost'),
+  SMTP_PORT: z.coerce.number().int().positive().default(1025),
+  // z.coerce.boolean() faz Boolean(string): "false" (não-vazia) virava true.
+  SMTP_SECURE: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((value) => value === 'true'),
+  SMTP_USER: z.string().optional(),
+  SMTP_PASS: z.string().optional(),
+  MAIL_FROM: z.string().email().default('noreply@auth-system.local'),
+  FRONTEND_URL: z.string().url().default('http://localhost:5173'),
 });
 
 export type Env = z.infer<typeof envSchema>;
