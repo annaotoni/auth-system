@@ -2,6 +2,7 @@ import { INestApplication, ValidationPipe } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { Test, TestingModule } from '@nestjs/testing';
 import { hash } from 'argon2';
+import cookieParser from 'cookie-parser';
 import request from 'supertest';
 import { App } from 'supertest/types';
 import { ARGON2_OPTIONS } from '../src/common/constants/argon2-options';
@@ -34,7 +35,12 @@ describe('Auth + Users (e2e)', () => {
       update: jest.Mock;
       create: jest.Mock;
     };
-    refreshToken: { create: jest.Mock };
+    refreshToken: {
+      create: jest.Mock;
+      update: jest.Mock;
+      updateMany: jest.Mock;
+      findUnique: jest.Mock;
+    };
     authAuditLog: { create: jest.Mock };
     $transaction: jest.Mock;
   };
@@ -59,6 +65,9 @@ describe('Auth + Users (e2e)', () => {
       },
       refreshToken: {
         create: jest.fn().mockResolvedValue({ id: 'refresh-1' }),
+        update: jest.fn(),
+        updateMany: jest.fn(),
+        findUnique: jest.fn().mockResolvedValue(null),
       },
       authAuditLog: { create: jest.fn() },
       $transaction: jest.fn().mockResolvedValue(undefined),
@@ -86,6 +95,7 @@ describe('Auth + Users (e2e)', () => {
       .compile();
 
     app = moduleFixture.createNestApplication();
+    app.use(cookieParser());
     app.useGlobalPipes(
       new ValidationPipe({ whitelist: true, transform: true }),
     );
@@ -252,6 +262,98 @@ describe('Auth + Users (e2e)', () => {
         .expect(401);
 
       expect(prisma.refreshToken.create).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('/auth/refresh (POST)', () => {
+    it('retorna 200, novo accessToken e novo cookie de refresh quando o token é válido', async () => {
+      prisma.refreshToken.findUnique.mockResolvedValue({
+        id: 'old-token-id',
+        userId: 'user-1',
+        familyId: 'family-1',
+        revokedAt: null,
+        expiresAt: new Date(Date.now() + 60_000),
+      });
+
+      const response = await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .set('Cookie', 'refreshToken=raw-old-token')
+        .expect(200);
+
+      expect(response.body).toEqual({ accessToken: expect.any(String) });
+      expect(prisma.refreshToken.create).toHaveBeenCalledTimes(1);
+      expect(prisma.refreshToken.update).toHaveBeenCalledTimes(1);
+
+      const cookies = response.headers['set-cookie'];
+      expect(cookies?.[0]).toMatch(/^refreshToken=/);
+      expect(cookies?.[0]).not.toMatch(/refreshToken=raw-old-token/);
+    });
+
+    it('retorna 401 quando não há cookie de refresh', async () => {
+      await request(app.getHttpServer()).post('/auth/refresh').expect(401);
+
+      expect(prisma.refreshToken.findUnique).not.toHaveBeenCalled();
+    });
+
+    it('retorna 401 quando o token não existe', async () => {
+      await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .set('Cookie', 'refreshToken=inexistente')
+        .expect(401);
+    });
+
+    it('retorna 401 e revoga a family inteira quando um token já revogado é reapresentado (reuse detection)', async () => {
+      prisma.refreshToken.findUnique.mockResolvedValue({
+        id: 'old-token-id',
+        userId: 'user-1',
+        familyId: 'family-1',
+        revokedAt: new Date(),
+        expiresAt: new Date(Date.now() + 60_000),
+      });
+
+      await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .set('Cookie', 'refreshToken=token-ja-usado')
+        .expect(401);
+
+      expect(prisma.refreshToken.create).not.toHaveBeenCalled();
+      expect(prisma.refreshToken.updateMany).toHaveBeenCalledWith({
+        where: { familyId: 'family-1', revokedAt: null },
+        data: { revokedAt: expect.any(Date) },
+      });
+      expect(prisma.authAuditLog.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({ eventType: 'TOKEN_REUSE_DETECTED' }),
+      });
+    });
+  });
+
+  describe('/auth/logout (POST)', () => {
+    it('revoga o token, limpa o cookie e retorna 200 quando havia uma sessão', async () => {
+      prisma.refreshToken.findUnique.mockResolvedValue({
+        id: 'token-1',
+        userId: 'user-1',
+        revokedAt: null,
+      });
+
+      const response = await request(app.getHttpServer())
+        .post('/auth/logout')
+        .set('Cookie', 'refreshToken=raw-token')
+        .expect(200);
+
+      expect(response.body).toEqual({ message: expect.any(String) });
+      expect(prisma.refreshToken.update).toHaveBeenCalledWith({
+        where: { id: 'token-1' },
+        data: { revokedAt: expect.any(Date) },
+      });
+
+      const cookies = response.headers['set-cookie'];
+      expect(cookies?.[0]).toMatch(/^refreshToken=;/);
+    });
+
+    it('retorna 200 mesmo sem cookie de refresh (idempotente)', async () => {
+      await request(app.getHttpServer()).post('/auth/logout').expect(200);
+
+      expect(prisma.refreshToken.update).not.toHaveBeenCalled();
     });
   });
 

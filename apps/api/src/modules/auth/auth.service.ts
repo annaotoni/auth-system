@@ -196,4 +196,113 @@ export class AuthService {
       },
     });
   }
+
+  async refresh(
+    rawToken: string,
+    ip?: string,
+    userAgent?: string,
+  ): Promise<LoginResult> {
+    const tokenRecord = await this.prisma.refreshToken.findUnique({
+      where: { tokenHash: hashToken(rawToken) },
+    });
+
+    if (!tokenRecord) {
+      throw new UnauthorizedException('Sessão inválida, faça login novamente');
+    }
+
+    // Token já revogado sendo reapresentado: outro refresh já rotacionou essa
+    // family depois dele — só acontece se alguém mais tiver esse valor
+    // (roubo). Revoga a family inteira, punindo atacante e vítima igualmente.
+    if (tokenRecord.revokedAt) {
+      await this.revokeFamily(
+        tokenRecord.familyId,
+        tokenRecord.userId,
+        ip,
+        userAgent,
+      );
+      throw new UnauthorizedException('Sessão inválida, faça login novamente');
+    }
+
+    if (tokenRecord.expiresAt < new Date()) {
+      throw new UnauthorizedException('Sessão expirada, faça login novamente');
+    }
+
+    const newTokenId = randomUUID();
+    const rawRefreshToken = randomBytes(32).toString('hex');
+
+    await this.prisma.$transaction([
+      this.prisma.refreshToken.create({
+        data: {
+          id: newTokenId,
+          userId: tokenRecord.userId,
+          tokenHash: hashToken(rawRefreshToken),
+          familyId: tokenRecord.familyId,
+          expiresAt: new Date(Date.now() + REFRESH_TOKEN_TTL_MS),
+          ip,
+          userAgent,
+        },
+      }),
+      this.prisma.refreshToken.update({
+        where: { id: tokenRecord.id },
+        data: { revokedAt: new Date(), replacedBy: newTokenId },
+      }),
+    ]);
+
+    const accessToken = this.jwtService.sign({ sub: tokenRecord.userId });
+
+    return { accessToken, refreshToken: rawRefreshToken };
+  }
+
+  async logout(
+    rawToken: string,
+    ip?: string,
+    userAgent?: string,
+  ): Promise<void> {
+    const tokenRecord = await this.prisma.refreshToken.findUnique({
+      where: { tokenHash: hashToken(rawToken) },
+    });
+
+    // Idempotente: token inexistente ou já revogado não é erro.
+    if (!tokenRecord || tokenRecord.revokedAt) {
+      return;
+    }
+
+    await this.prisma.$transaction([
+      this.prisma.refreshToken.update({
+        where: { id: tokenRecord.id },
+        data: { revokedAt: new Date() },
+      }),
+      this.prisma.authAuditLog.create({
+        data: {
+          userId: tokenRecord.userId,
+          eventType: 'LOGOUT',
+          ip,
+          userAgent,
+        },
+      }),
+    ]);
+  }
+
+  private async revokeFamily(
+    familyId: string,
+    userId: string,
+    ip?: string,
+    userAgent?: string,
+  ): Promise<void> {
+    await this.prisma.$transaction([
+      this.prisma.refreshToken.updateMany({
+        where: { familyId, revokedAt: null },
+        data: { revokedAt: new Date() },
+      }),
+      this.prisma.authAuditLog.create({
+        data: {
+          userId,
+          eventType: 'TOKEN_REUSE_DETECTED',
+          ip,
+          userAgent,
+          metadata: { familyId },
+        },
+      }),
+    ]);
+  }
 }

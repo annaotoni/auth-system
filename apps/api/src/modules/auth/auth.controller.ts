@@ -7,10 +7,12 @@ import {
   Ip,
   Post,
   Query,
+  Req,
   Res,
+  UnauthorizedException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import type { Response } from 'express';
+import type { Request, Response } from 'express';
 import {
   REFRESH_TOKEN_COOKIE_NAME,
   REFRESH_TOKEN_TTL_MS,
@@ -26,6 +28,16 @@ export class AuthController {
     private readonly authService: AuthService,
     private readonly config: ConfigService,
   ) {}
+
+  private setRefreshCookie(res: Response, token: string): void {
+    res.cookie(REFRESH_TOKEN_COOKIE_NAME, token, {
+      httpOnly: true,
+      secure: this.config.getOrThrow<string>('NODE_ENV') === 'production',
+      sameSite: 'strict',
+      maxAge: REFRESH_TOKEN_TTL_MS,
+      path: '/auth',
+    });
+  }
 
   @Post('register')
   @HttpCode(201)
@@ -61,14 +73,54 @@ export class AuthController {
       userAgent,
     );
 
-    res.cookie(REFRESH_TOKEN_COOKIE_NAME, refreshToken, {
-      httpOnly: true,
-      secure: this.config.getOrThrow<string>('NODE_ENV') === 'production',
-      sameSite: 'strict',
-      maxAge: REFRESH_TOKEN_TTL_MS,
-      path: '/auth',
-    });
+    this.setRefreshCookie(res, refreshToken);
 
     return { accessToken };
+  }
+
+  @Post('refresh')
+  @HttpCode(200)
+  async refresh(
+    @Req() req: Request,
+    @Ip() ip: string,
+    @Res({ passthrough: true }) res: Response,
+    @Headers('user-agent') userAgent?: string,
+  ): Promise<{ accessToken: string }> {
+    const rawToken = req.cookies?.[REFRESH_TOKEN_COOKIE_NAME] as
+      string | undefined;
+
+    if (!rawToken) {
+      throw new UnauthorizedException('Refresh token ausente');
+    }
+
+    const { accessToken, refreshToken } = await this.authService.refresh(
+      rawToken,
+      ip,
+      userAgent,
+    );
+
+    this.setRefreshCookie(res, refreshToken);
+
+    return { accessToken };
+  }
+
+  @Post('logout')
+  @HttpCode(200)
+  async logout(
+    @Req() req: Request,
+    @Ip() ip: string,
+    @Res({ passthrough: true }) res: Response,
+    @Headers('user-agent') userAgent?: string,
+  ): Promise<{ message: string }> {
+    const rawToken = req.cookies?.[REFRESH_TOKEN_COOKIE_NAME] as
+      string | undefined;
+
+    if (rawToken) {
+      await this.authService.logout(rawToken, ip, userAgent);
+    }
+
+    res.clearCookie(REFRESH_TOKEN_COOKIE_NAME, { path: '/auth' });
+
+    return { message: 'Logout realizado com sucesso.' };
   }
 }

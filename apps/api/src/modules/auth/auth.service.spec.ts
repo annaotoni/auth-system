@@ -18,7 +18,12 @@ describe('AuthService', () => {
       update: jest.Mock;
       create: jest.Mock;
     };
-    refreshToken: { create: jest.Mock };
+    refreshToken: {
+      create: jest.Mock;
+      update: jest.Mock;
+      updateMany: jest.Mock;
+      findUnique: jest.Mock;
+    };
     authAuditLog: { create: jest.Mock };
     $transaction: jest.Mock;
   };
@@ -34,7 +39,12 @@ describe('AuthService', () => {
         update: jest.fn(),
         create: jest.fn(),
       },
-      refreshToken: { create: jest.fn() },
+      refreshToken: {
+        create: jest.fn(),
+        update: jest.fn(),
+        updateMany: jest.fn(),
+        findUnique: jest.fn(),
+      },
       authAuditLog: { create: jest.fn() },
       $transaction: jest.fn().mockResolvedValue(undefined),
     };
@@ -250,6 +260,138 @@ describe('AuthService', () => {
           metadata: { email: 'user@example.com', reason: 'email_not_verified' },
         },
       });
+    });
+  });
+
+  describe('refresh', () => {
+    it('rotaciona: cria novo token na mesma family e revoga o atual apontando pro novo', async () => {
+      prisma.refreshToken.findUnique.mockResolvedValue({
+        id: 'old-token-id',
+        userId: 'user-1',
+        familyId: 'family-1',
+        revokedAt: null,
+        expiresAt: new Date(Date.now() + 60_000),
+      });
+
+      const result = await service.refresh(
+        'raw-old-token',
+        '127.0.0.1',
+        'jest',
+      );
+
+      expect(result.accessToken).toBe('signed-access-token');
+      expect(jwtService.sign).toHaveBeenCalledWith({ sub: 'user-1' });
+      expect(result.refreshToken).toMatch(/^[0-9a-f]{64}$/);
+      expect(result.refreshToken).not.toBe('raw-old-token');
+
+      expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+
+      const createArgs = prisma.refreshToken.create.mock.calls[0][0];
+      expect(createArgs.data.userId).toBe('user-1');
+      expect(createArgs.data.familyId).toBe('family-1');
+      expect(createArgs.data.tokenHash).toMatch(/^[0-9a-f]{64}$/);
+
+      const updateArgs = prisma.refreshToken.update.mock.calls[0][0];
+      expect(updateArgs.where).toEqual({ id: 'old-token-id' });
+      expect(updateArgs.data.revokedAt).toBeInstanceOf(Date);
+      expect(updateArgs.data.replacedBy).toBe(createArgs.data.id);
+    });
+
+    it('lança UnauthorizedException quando o token não existe', async () => {
+      prisma.refreshToken.findUnique.mockResolvedValue(null);
+
+      await expect(service.refresh('token-inexistente')).rejects.toThrow(
+        UnauthorizedException,
+      );
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+    });
+
+    it('lança UnauthorizedException quando o token expirou (mas não estava revogado)', async () => {
+      prisma.refreshToken.findUnique.mockResolvedValue({
+        id: 'old-token-id',
+        userId: 'user-1',
+        familyId: 'family-1',
+        revokedAt: null,
+        expiresAt: new Date(Date.now() - 1_000),
+      });
+
+      await expect(service.refresh('token-expirado')).rejects.toThrow(
+        UnauthorizedException,
+      );
+      expect(prisma.refreshToken.create).not.toHaveBeenCalled();
+    });
+
+    it('detecta reuso: token revogado reapresentado revoga a family inteira e grava TOKEN_REUSE_DETECTED', async () => {
+      prisma.refreshToken.findUnique.mockResolvedValue({
+        id: 'old-token-id',
+        userId: 'user-1',
+        familyId: 'family-1',
+        revokedAt: new Date(),
+        expiresAt: new Date(Date.now() + 60_000),
+      });
+
+      await expect(
+        service.refresh('token-ja-usado', '127.0.0.1', 'jest'),
+      ).rejects.toThrow(UnauthorizedException);
+
+      expect(prisma.refreshToken.create).not.toHaveBeenCalled();
+      expect(prisma.refreshToken.updateMany).toHaveBeenCalledWith({
+        where: { familyId: 'family-1', revokedAt: null },
+        data: { revokedAt: expect.any(Date) },
+      });
+      expect(prisma.authAuditLog.create).toHaveBeenCalledWith({
+        data: {
+          userId: 'user-1',
+          eventType: 'TOKEN_REUSE_DETECTED',
+          ip: '127.0.0.1',
+          userAgent: 'jest',
+          metadata: { familyId: 'family-1' },
+        },
+      });
+    });
+  });
+
+  describe('logout', () => {
+    it('revoga o token e grava LOGOUT quando o token existe e não estava revogado', async () => {
+      prisma.refreshToken.findUnique.mockResolvedValue({
+        id: 'token-1',
+        userId: 'user-1',
+        revokedAt: null,
+      });
+
+      await service.logout('raw-token', '127.0.0.1', 'jest');
+
+      expect(prisma.refreshToken.update).toHaveBeenCalledWith({
+        where: { id: 'token-1' },
+        data: { revokedAt: expect.any(Date) },
+      });
+      expect(prisma.authAuditLog.create).toHaveBeenCalledWith({
+        data: {
+          userId: 'user-1',
+          eventType: 'LOGOUT',
+          ip: '127.0.0.1',
+          userAgent: 'jest',
+        },
+      });
+    });
+
+    it('não faz nada quando o token não existe', async () => {
+      prisma.refreshToken.findUnique.mockResolvedValue(null);
+
+      await expect(service.logout('inexistente')).resolves.toBeUndefined();
+      expect(prisma.refreshToken.update).not.toHaveBeenCalled();
+      expect(prisma.authAuditLog.create).not.toHaveBeenCalled();
+    });
+
+    it('não faz nada quando o token já estava revogado', async () => {
+      prisma.refreshToken.findUnique.mockResolvedValue({
+        id: 'token-1',
+        userId: 'user-1',
+        revokedAt: new Date(),
+      });
+
+      await expect(service.logout('ja-revogado')).resolves.toBeUndefined();
+      expect(prisma.refreshToken.update).not.toHaveBeenCalled();
     });
   });
 
