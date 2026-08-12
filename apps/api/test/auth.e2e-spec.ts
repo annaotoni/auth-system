@@ -7,6 +7,7 @@ import request from 'supertest';
 import { App } from 'supertest/types';
 import { ARGON2_OPTIONS } from '../src/common/constants/argon2-options';
 import { AuthModule } from '../src/modules/auth/auth.module';
+import { HibpService } from '../src/modules/hibp/hibp.service';
 import { MailService } from '../src/modules/mail/mail.service';
 import { UsersModule } from '../src/modules/users/users.module';
 import { PrismaModule } from '../src/prisma/prisma.module';
@@ -53,6 +54,7 @@ describe('Auth + Users (e2e)', () => {
     sendVerificationEmail: jest.Mock;
     sendPasswordResetEmail: jest.Mock;
   };
+  let hibpService: { isPasswordPwned: jest.Mock };
   let validPasswordHash: string;
 
   beforeAll(async () => {
@@ -89,6 +91,7 @@ describe('Auth + Users (e2e)', () => {
       sendVerificationEmail: jest.fn().mockResolvedValue(undefined),
       sendPasswordResetEmail: jest.fn().mockResolvedValue(undefined),
     };
+    hibpService = { isPasswordPwned: jest.fn().mockResolvedValue(false) };
 
     const moduleFixture: TestingModule = await Test.createTestingModule({
       imports: [
@@ -102,6 +105,8 @@ describe('Auth + Users (e2e)', () => {
         PrismaModule,
       ],
     })
+      .overrideProvider(HibpService)
+      .useValue(hibpService)
       .overrideProvider(PrismaService)
       .useValue(prisma)
       .overrideProvider(MailService)
@@ -182,6 +187,17 @@ describe('Auth + Users (e2e)', () => {
 
       expect(prisma.user.create).not.toHaveBeenCalled();
     });
+
+    it('retorna 400 quando a senha apareceu em vazamentos conhecidos (HIBP)', async () => {
+      hibpService.isPasswordPwned.mockResolvedValue(true);
+
+      await request(app.getHttpServer())
+        .post('/auth/register')
+        .send({ email: 'valido@example.com', password: 'senha-vazada' })
+        .expect(400);
+
+      expect(prisma.user.create).not.toHaveBeenCalled();
+    });
   });
 
   describe('/auth/verify (GET)', () => {
@@ -252,6 +268,8 @@ describe('Auth + Users (e2e)', () => {
         email: 'user@example.com',
         passwordHash: validPasswordHash,
         emailVerifiedAt: new Date(),
+        failedLoginCount: 0,
+        lockedUntil: null,
       });
 
       await request(app.getHttpServer())
@@ -275,6 +293,25 @@ describe('Auth + Users (e2e)', () => {
         .send({ email: 'user@example.com', password: 'senha-correta-123' })
         .expect(401);
 
+      expect(prisma.refreshToken.create).not.toHaveBeenCalled();
+    });
+
+    it('retorna 401 com mensagem genérica quando a conta está travada por lockout, mesmo com a senha correta', async () => {
+      prisma.user.findUnique.mockResolvedValue({
+        id: 'user-1',
+        email: 'user@example.com',
+        passwordHash: validPasswordHash,
+        emailVerifiedAt: new Date(),
+        failedLoginCount: 5,
+        lockedUntil: new Date(Date.now() + 60_000),
+      });
+
+      const response = await request(app.getHttpServer())
+        .post('/auth/login')
+        .send({ email: 'user@example.com', password: 'senha-correta-123' })
+        .expect(401);
+
+      expect(response.body.message).toBe('Credenciais inválidas');
       expect(prisma.refreshToken.create).not.toHaveBeenCalled();
     });
   });
@@ -440,6 +477,17 @@ describe('Auth + Users (e2e)', () => {
       await request(app.getHttpServer())
         .post('/auth/reset-password')
         .send({ token: 'token-valido', newPassword: 'curta' })
+        .expect(400);
+
+      expect(prisma.passwordResetToken.findUnique).not.toHaveBeenCalled();
+    });
+
+    it('retorna 400 quando a nova senha apareceu em vazamentos conhecidos (HIBP)', async () => {
+      hibpService.isPasswordPwned.mockResolvedValue(true);
+
+      await request(app.getHttpServer())
+        .post('/auth/reset-password')
+        .send({ token: 'token-valido', newPassword: 'senha-vazada' })
         .expect(400);
 
       expect(prisma.passwordResetToken.findUnique).not.toHaveBeenCalled();

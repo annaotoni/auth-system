@@ -12,6 +12,7 @@ import {
   UnauthorizedException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { Throttle } from '@nestjs/throttler';
 import type { Request, Response } from 'express';
 import {
   REFRESH_TOKEN_COOKIE_NAME,
@@ -43,6 +44,7 @@ export class AuthController {
 
   @Post('register')
   @HttpCode(201)
+  @Throttle({ default: { limit: 5, ttl: 60_000 } })
   async register(@Body() dto: RegisterDto): Promise<{ message: string }> {
     await this.authService.register(dto);
     return {
@@ -63,6 +65,7 @@ export class AuthController {
 
   @Post('login')
   @HttpCode(200)
+  @Throttle({ default: { limit: 5, ttl: 60_000 } })
   async login(
     @Body() dto: LoginDto,
     @Ip() ip: string,
@@ -128,6 +131,7 @@ export class AuthController {
 
   @Post('forgot-password')
   @HttpCode(200)
+  @Throttle({ default: { limit: 3, ttl: 60_000 } })
   async forgotPassword(
     @Body() dto: ForgotPasswordDto,
   ): Promise<{ message: string }> {

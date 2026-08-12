@@ -5,6 +5,7 @@ import { Prisma } from '@prisma/client';
 import { hash } from 'argon2';
 import { ARGON2_OPTIONS } from '../../common/constants/argon2-options';
 import { PrismaService } from '../../prisma/prisma.service';
+import { HibpService } from '../hibp/hibp.service';
 import { MailService } from '../mail/mail.service';
 import { UsersService } from '../users/users.service';
 import { AuthService } from './auth.service';
@@ -38,6 +39,7 @@ describe('AuthService', () => {
     sendPasswordResetEmail: jest.Mock;
   };
   let jwtService: { sign: jest.Mock };
+  let hibpService: { isPasswordPwned: jest.Mock };
 
   beforeEach(async () => {
     prisma = {
@@ -67,6 +69,7 @@ describe('AuthService', () => {
       sendPasswordResetEmail: jest.fn(),
     };
     jwtService = { sign: jest.fn().mockReturnValue('signed-access-token') };
+    hibpService = { isPasswordPwned: jest.fn().mockResolvedValue(false) };
 
     const module = await Test.createTestingModule({
       providers: [
@@ -75,6 +78,7 @@ describe('AuthService', () => {
         { provide: UsersService, useValue: usersService },
         { provide: MailService, useValue: mailService },
         { provide: JwtService, useValue: jwtService },
+        { provide: HibpService, useValue: hibpService },
       ],
     }).compile();
 
@@ -164,6 +168,20 @@ describe('AuthService', () => {
 
       expect(mailService.sendVerificationEmail).not.toHaveBeenCalled();
     });
+
+    it('lança BadRequestException quando a senha apareceu em vazamentos conhecidos (HIBP)', async () => {
+      hibpService.isPasswordPwned.mockResolvedValue(true);
+
+      await expect(
+        service.register({
+          email: 'novo@example.com',
+          password: 'senha-vazada',
+        }),
+      ).rejects.toThrow(BadRequestException);
+
+      expect(usersService.findByEmail).not.toHaveBeenCalled();
+      expect(prisma.user.create).not.toHaveBeenCalled();
+    });
   });
 
   describe('login', () => {
@@ -234,6 +252,8 @@ describe('AuthService', () => {
         id: 'user-1',
         passwordHash,
         emailVerifiedAt: new Date(),
+        failedLoginCount: 0,
+        lockedUntil: null,
       });
 
       await expect(
@@ -275,6 +295,91 @@ describe('AuthService', () => {
           userAgent: undefined,
           metadata: { email: 'user@example.com', reason: 'email_not_verified' },
         },
+      });
+    });
+
+    describe('lockout progressivo', () => {
+      it('incrementa failedLoginCount numa senha errada sem travar antes do threshold', async () => {
+        usersService.findByEmail.mockResolvedValue({
+          id: 'user-1',
+          passwordHash,
+          emailVerifiedAt: new Date(),
+          failedLoginCount: 2,
+          lockedUntil: null,
+        });
+
+        await expect(
+          service.login({ email: 'user@example.com', password: 'errada' }),
+        ).rejects.toThrow(UnauthorizedException);
+
+        expect(prisma.user.update).toHaveBeenCalledWith({
+          where: { id: 'user-1' },
+          data: { failedLoginCount: 3, lockedUntil: undefined },
+        });
+      });
+
+      it('trava a conta ao atingir o threshold de falhas', async () => {
+        usersService.findByEmail.mockResolvedValue({
+          id: 'user-1',
+          passwordHash,
+          emailVerifiedAt: new Date(),
+          failedLoginCount: 4,
+          lockedUntil: null,
+        });
+
+        await expect(
+          service.login({ email: 'user@example.com', password: 'errada' }),
+        ).rejects.toThrow(UnauthorizedException);
+
+        const updateArgs = prisma.user.update.mock.calls[0][0];
+        expect(updateArgs.data.failedLoginCount).toBe(5);
+        expect(updateArgs.data.lockedUntil).toBeInstanceOf(Date);
+        expect(updateArgs.data.lockedUntil.getTime()).toBeGreaterThan(
+          Date.now(),
+        );
+      });
+
+      it('rejeita com mensagem genérica quando a conta está travada, mesmo com a senha correta, sem incrementar o contador de novo', async () => {
+        usersService.findByEmail.mockResolvedValue({
+          id: 'user-1',
+          passwordHash,
+          emailVerifiedAt: new Date(),
+          failedLoginCount: 5,
+          lockedUntil: new Date(Date.now() + 60_000),
+        });
+
+        await expect(
+          service.login({ email: 'user@example.com', password }),
+        ).rejects.toThrow(UnauthorizedException);
+
+        expect(prisma.user.update).not.toHaveBeenCalled();
+        expect(prisma.authAuditLog.create).toHaveBeenCalledWith({
+          data: {
+            userId: 'user-1',
+            eventType: 'LOGIN_FAILED',
+            ip: undefined,
+            userAgent: undefined,
+            metadata: { email: 'user@example.com', reason: 'account_locked' },
+          },
+        });
+      });
+
+      it('reseta failedLoginCount e lockedUntil quando o login é bem-sucedido', async () => {
+        usersService.findByEmail.mockResolvedValue({
+          id: 'user-1',
+          passwordHash,
+          emailVerifiedAt: new Date(),
+          failedLoginCount: 3,
+          lockedUntil: null,
+        });
+        prisma.refreshToken.create.mockResolvedValue({ id: 'refresh-1' });
+
+        await service.login({ email: 'user@example.com', password });
+
+        expect(prisma.user.update).toHaveBeenCalledWith({
+          where: { id: 'user-1' },
+          data: { failedLoginCount: 0, lockedUntil: null },
+        });
       });
     });
   });
@@ -518,6 +623,16 @@ describe('AuthService', () => {
       await expect(
         service.resetPassword('expirado', 'nova-senha-1234'),
       ).rejects.toThrow(BadRequestException);
+    });
+
+    it('lança BadRequestException quando a nova senha apareceu em vazamentos conhecidos (HIBP)', async () => {
+      hibpService.isPasswordPwned.mockResolvedValue(true);
+
+      await expect(
+        service.resetPassword('token-valido', 'senha-vazada'),
+      ).rejects.toThrow(BadRequestException);
+
+      expect(prisma.passwordResetToken.findUnique).not.toHaveBeenCalled();
     });
   });
 

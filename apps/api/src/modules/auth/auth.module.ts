@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtModule } from '@nestjs/jwt';
 import { PassportModule } from '@nestjs/passport';
+import { HibpModule } from '../hibp/hibp.module';
 import { MailModule } from '../mail/mail.module';
 import { UsersModule } from '../users/users.module';
 import { ACCESS_TOKEN_TTL } from './auth.constants';
@@ -13,6 +14,7 @@ import { JwtAccessStrategy } from './strategies/jwt-access.strategy';
   imports: [
     UsersModule,
     MailModule,
+    HibpModule,
     PassportModule,
     JwtModule.registerAsync({
       inject: [ConfigService],

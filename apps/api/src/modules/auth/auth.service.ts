@@ -4,7 +4,7 @@ import {
   UnauthorizedException,
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
-import { Prisma } from '@prisma/client';
+import { Prisma, User } from '@prisma/client';
 import { hash, verify } from 'argon2';
 import { randomBytes, randomUUID } from 'node:crypto';
 import {
@@ -13,14 +13,21 @@ import {
 } from '../../common/constants/argon2-options';
 import { hashToken } from '../../common/crypto/hash-token';
 import { PrismaService } from '../../prisma/prisma.service';
+import { HibpService } from '../hibp/hibp.service';
 import { MailService } from '../mail/mail.service';
 import { UsersService } from '../users/users.service';
-import { REFRESH_TOKEN_TTL_MS } from './auth.constants';
+import {
+  LOCKOUT_THRESHOLD,
+  LOCKOUT_TIERS_MS,
+  REFRESH_TOKEN_TTL_MS,
+} from './auth.constants';
 import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
 
 const EMAIL_VERIFICATION_TTL_MS = 24 * 60 * 60 * 1000;
 const PASSWORD_RESET_TTL_MS = 30 * 60 * 1000;
+const PWNED_PASSWORD_MESSAGE =
+  'Esta senha apareceu em vazamentos de dados conhecidos. Escolha outra.';
 
 export interface LoginResult {
   accessToken: string;
@@ -34,9 +41,14 @@ export class AuthService {
     private readonly usersService: UsersService,
     private readonly mailService: MailService,
     private readonly jwtService: JwtService,
+    private readonly hibpService: HibpService,
   ) {}
 
   async register(dto: RegisterDto): Promise<void> {
+    if (await this.hibpService.isPasswordPwned(dto.password)) {
+      throw new BadRequestException(PWNED_PASSWORD_MESSAGE);
+    }
+
     const existing = await this.usersService.findByEmail(dto.email);
 
     // Hash sempre computado, exista ou não a conta: sem esse custo simétrico,
@@ -131,16 +143,27 @@ export class AuthService {
 
     // Sempre roda argon2.verify, mesmo sem usuário (contra um hash dummy):
     // sem esse custo simétrico, o tempo de resposta denunciaria se o
-    // e-mail está cadastrado.
+    // e-mail está cadastrado. Precisa rodar ANTES de checar lockedUntil,
+    // senão uma conta travada responderia mais rápido — outro vazamento
+    // por timing, agora revelando o estado de bloqueio.
     const passwordValid = await verify(
       user?.passwordHash ?? (await getDummyHash()),
       dto.password,
     );
 
-    if (!user || !passwordValid) {
+    const isLocked = Boolean(
+      user?.lockedUntil && user.lockedUntil > new Date(),
+    );
+
+    if (!user || !passwordValid || isLocked) {
+      if (user && !isLocked) {
+        await this.recordFailedAttempt(user);
+      }
+      // Mensagem genérica mesmo quando travada: não revelar o estado de
+      // lockout evita dar feedback de progresso a quem está forçando a conta.
       await this.logFailedLogin(
         dto.email,
-        'invalid_credentials',
+        isLocked ? 'account_locked' : 'invalid_credentials',
         ip,
         userAgent,
         user?.id,
@@ -157,6 +180,13 @@ export class AuthService {
         user.id,
       );
       throw new UnauthorizedException('E-mail não verificado');
+    }
+
+    if (user.failedLoginCount > 0 || user.lockedUntil) {
+      await this.prisma.user.update({
+        where: { id: user.id },
+        data: { failedLoginCount: 0, lockedUntil: null },
+      });
     }
 
     const accessToken = this.jwtService.sign({ sub: user.id });
@@ -178,6 +208,32 @@ export class AuthService {
     });
 
     return { accessToken, refreshToken: rawRefreshToken };
+  }
+
+  private async recordFailedAttempt(user: User): Promise<void> {
+    const failedLoginCount = user.failedLoginCount + 1;
+    const lockoutDurationMs = this.computeLockoutDuration(failedLoginCount);
+
+    await this.prisma.user.update({
+      where: { id: user.id },
+      data: {
+        failedLoginCount,
+        lockedUntil: lockoutDurationMs
+          ? new Date(Date.now() + lockoutDurationMs)
+          : undefined,
+      },
+    });
+  }
+
+  private computeLockoutDuration(failedLoginCount: number): number | null {
+    if (failedLoginCount < LOCKOUT_THRESHOLD) {
+      return null;
+    }
+    const tier = Math.min(
+      Math.floor((failedLoginCount - LOCKOUT_THRESHOLD) / 5),
+      LOCKOUT_TIERS_MS.length - 1,
+    );
+    return LOCKOUT_TIERS_MS[tier];
   }
 
   private async logFailedLogin(
@@ -335,6 +391,10 @@ export class AuthService {
     ip?: string,
     userAgent?: string,
   ): Promise<void> {
+    if (await this.hibpService.isPasswordPwned(newPassword)) {
+      throw new BadRequestException(PWNED_PASSWORD_MESSAGE);
+    }
+
     const tokenRecord = await this.prisma.passwordResetToken.findUnique({
       where: { tokenHash: hashToken(rawToken) },
     });
