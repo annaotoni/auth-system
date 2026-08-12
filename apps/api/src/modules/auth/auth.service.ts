@@ -1,15 +1,30 @@
-import { BadRequestException, Injectable } from '@nestjs/common';
+import {
+  BadRequestException,
+  Injectable,
+  UnauthorizedException,
+} from '@nestjs/common';
+import { JwtService } from '@nestjs/jwt';
 import { Prisma } from '@prisma/client';
-import { hash } from 'argon2';
-import { randomBytes } from 'node:crypto';
-import { ARGON2_OPTIONS } from '../../common/constants/argon2-options';
+import { hash, verify } from 'argon2';
+import { randomBytes, randomUUID } from 'node:crypto';
+import {
+  ARGON2_OPTIONS,
+  getDummyHash,
+} from '../../common/constants/argon2-options';
 import { hashToken } from '../../common/crypto/hash-token';
 import { PrismaService } from '../../prisma/prisma.service';
 import { MailService } from '../mail/mail.service';
 import { UsersService } from '../users/users.service';
+import { REFRESH_TOKEN_TTL_MS } from './auth.constants';
+import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
 
 const EMAIL_VERIFICATION_TTL_MS = 24 * 60 * 60 * 1000;
+
+export interface LoginResult {
+  accessToken: string;
+  refreshToken: string;
+}
 
 @Injectable()
 export class AuthService {
@@ -17,6 +32,7 @@ export class AuthService {
     private readonly prisma: PrismaService,
     private readonly usersService: UsersService,
     private readonly mailService: MailService,
+    private readonly jwtService: JwtService,
   ) {}
 
   async register(dto: RegisterDto): Promise<void> {
@@ -103,5 +119,81 @@ export class AuthService {
         },
       }),
     ]);
+  }
+
+  async login(
+    dto: LoginDto,
+    ip?: string,
+    userAgent?: string,
+  ): Promise<LoginResult> {
+    const user = await this.usersService.findByEmail(dto.email);
+
+    // Sempre roda argon2.verify, mesmo sem usuário (contra um hash dummy):
+    // sem esse custo simétrico, o tempo de resposta denunciaria se o
+    // e-mail está cadastrado.
+    const passwordValid = await verify(
+      user?.passwordHash ?? (await getDummyHash()),
+      dto.password,
+    );
+
+    if (!user || !passwordValid) {
+      await this.logFailedLogin(
+        dto.email,
+        'invalid_credentials',
+        ip,
+        userAgent,
+        user?.id,
+      );
+      throw new UnauthorizedException('Credenciais inválidas');
+    }
+
+    if (!user.emailVerifiedAt) {
+      await this.logFailedLogin(
+        dto.email,
+        'email_not_verified',
+        ip,
+        userAgent,
+        user.id,
+      );
+      throw new UnauthorizedException('E-mail não verificado');
+    }
+
+    const accessToken = this.jwtService.sign({ sub: user.id });
+    const rawRefreshToken = randomBytes(32).toString('hex');
+
+    await this.prisma.refreshToken.create({
+      data: {
+        userId: user.id,
+        tokenHash: hashToken(rawRefreshToken),
+        familyId: randomUUID(),
+        expiresAt: new Date(Date.now() + REFRESH_TOKEN_TTL_MS),
+        ip,
+        userAgent,
+      },
+    });
+
+    await this.prisma.authAuditLog.create({
+      data: { userId: user.id, eventType: 'LOGIN_SUCCESS', ip, userAgent },
+    });
+
+    return { accessToken, refreshToken: rawRefreshToken };
+  }
+
+  private async logFailedLogin(
+    email: string,
+    reason: string,
+    ip?: string,
+    userAgent?: string,
+    userId?: string,
+  ): Promise<void> {
+    await this.prisma.authAuditLog.create({
+      data: {
+        userId,
+        eventType: 'LOGIN_FAILED',
+        ip,
+        userAgent,
+        metadata: { email, reason },
+      },
+    });
   }
 }

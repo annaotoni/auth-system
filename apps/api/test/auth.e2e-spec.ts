@@ -1,28 +1,49 @@
 import { INestApplication, ValidationPipe } from '@nestjs/common';
+import { ConfigModule } from '@nestjs/config';
 import { Test, TestingModule } from '@nestjs/testing';
+import { hash } from 'argon2';
 import request from 'supertest';
 import { App } from 'supertest/types';
+import { ARGON2_OPTIONS } from '../src/common/constants/argon2-options';
 import { AuthModule } from '../src/modules/auth/auth.module';
 import { MailService } from '../src/modules/mail/mail.service';
+import { UsersModule } from '../src/modules/users/users.module';
 import { PrismaModule } from '../src/prisma/prisma.module';
 import { PrismaService } from '../src/prisma/prisma.service';
 
+const TEST_ENV = {
+  JWT_ACCESS_SECRET: 'e2e-test-secret-com-pelo-menos-32-caracteres',
+  NODE_ENV: 'test',
+};
+
 // PrismaService e MailService são mockados: este e2e cobre a camada HTTP
-// (validação, status, formato de resposta), não o banco real. A suíte com
-// Postgres real fica pra Fase 7, quando o isolamento do banco de teste for montado.
-describe('AuthController (e2e)', () => {
+// (validação, status, formato de resposta, guards), não o banco real. A
+// suíte com Postgres real fica pra Fase 7, quando o isolamento do banco de
+// teste for montado. ConfigModule usa `load` (não o .env real) pra ficar
+// hermético e funcionar igual em CI.
+describe('Auth + Users (e2e)', () => {
   let app: INestApplication<App>;
   let prisma: {
-    user: { findUnique: jest.Mock; create: jest.Mock; update: jest.Mock };
+    user: {
+      findUnique: jest.Mock;
+      create: jest.Mock;
+      update: jest.Mock;
+    };
     emailVerificationToken: {
       findUnique: jest.Mock;
       update: jest.Mock;
       create: jest.Mock;
     };
+    refreshToken: { create: jest.Mock };
     authAuditLog: { create: jest.Mock };
     $transaction: jest.Mock;
   };
   let mailService: { sendVerificationEmail: jest.Mock };
+  let validPasswordHash: string;
+
+  beforeAll(async () => {
+    validPasswordHash = await hash('senha-correta-123', ARGON2_OPTIONS);
+  });
 
   beforeEach(async () => {
     prisma = {
@@ -36,6 +57,9 @@ describe('AuthController (e2e)', () => {
         update: jest.fn(),
         create: jest.fn(),
       },
+      refreshToken: {
+        create: jest.fn().mockResolvedValue({ id: 'refresh-1' }),
+      },
       authAuditLog: { create: jest.fn() },
       $transaction: jest.fn().mockResolvedValue(undefined),
     };
@@ -44,7 +68,16 @@ describe('AuthController (e2e)', () => {
     };
 
     const moduleFixture: TestingModule = await Test.createTestingModule({
-      imports: [AuthModule, PrismaModule],
+      imports: [
+        ConfigModule.forRoot({
+          isGlobal: true,
+          ignoreEnvFile: true,
+          load: [() => TEST_ENV],
+        }),
+        AuthModule,
+        UsersModule,
+        PrismaModule,
+      ],
     })
       .overrideProvider(PrismaService)
       .useValue(prisma)
@@ -154,6 +187,123 @@ describe('AuthController (e2e)', () => {
 
       expect(response.body).toEqual({ message: expect.any(String) });
       expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('/auth/login (POST)', () => {
+    it('retorna 200, accessToken no corpo e cookie httpOnly de refresh quando as credenciais são válidas', async () => {
+      prisma.user.findUnique.mockResolvedValue({
+        id: 'user-1',
+        email: 'user@example.com',
+        passwordHash: validPasswordHash,
+        emailVerifiedAt: new Date(),
+      });
+
+      const response = await request(app.getHttpServer())
+        .post('/auth/login')
+        .send({ email: 'user@example.com', password: 'senha-correta-123' })
+        .expect(200);
+
+      expect(response.body).toEqual({ accessToken: expect.any(String) });
+      expect(prisma.refreshToken.create).toHaveBeenCalledTimes(1);
+
+      const cookies = response.headers['set-cookie'];
+      expect(cookies?.[0]).toMatch(/^refreshToken=/);
+      expect(cookies?.[0]).toMatch(/HttpOnly/i);
+      expect(cookies?.[0]).toMatch(/SameSite=Strict/i);
+    });
+
+    it('retorna 401 quando o usuário não existe', async () => {
+      await request(app.getHttpServer())
+        .post('/auth/login')
+        .send({ email: 'ninguem@example.com', password: 'qualquer-coisa' })
+        .expect(401);
+
+      expect(prisma.refreshToken.create).not.toHaveBeenCalled();
+    });
+
+    it('retorna 401 quando a senha está errada', async () => {
+      prisma.user.findUnique.mockResolvedValue({
+        id: 'user-1',
+        email: 'user@example.com',
+        passwordHash: validPasswordHash,
+        emailVerifiedAt: new Date(),
+      });
+
+      await request(app.getHttpServer())
+        .post('/auth/login')
+        .send({ email: 'user@example.com', password: 'senha-errada' })
+        .expect(401);
+
+      expect(prisma.refreshToken.create).not.toHaveBeenCalled();
+    });
+
+    it('retorna 401 quando o e-mail nunca foi verificado', async () => {
+      prisma.user.findUnique.mockResolvedValue({
+        id: 'user-1',
+        email: 'user@example.com',
+        passwordHash: validPasswordHash,
+        emailVerifiedAt: null,
+      });
+
+      await request(app.getHttpServer())
+        .post('/auth/login')
+        .send({ email: 'user@example.com', password: 'senha-correta-123' })
+        .expect(401);
+
+      expect(prisma.refreshToken.create).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('/users/me (GET)', () => {
+    async function login(): Promise<string> {
+      prisma.user.findUnique.mockResolvedValue({
+        id: 'user-1',
+        email: 'user@example.com',
+        passwordHash: validPasswordHash,
+        emailVerifiedAt: new Date(),
+      });
+
+      const response = await request(app.getHttpServer())
+        .post('/auth/login')
+        .send({ email: 'user@example.com', password: 'senha-correta-123' })
+        .expect(200);
+
+      return (response.body as { accessToken: string }).accessToken;
+    }
+
+    it('retorna 401 sem token', async () => {
+      await request(app.getHttpServer()).get('/users/me').expect(401);
+    });
+
+    it('retorna 401 com um token inválido', async () => {
+      await request(app.getHttpServer())
+        .get('/users/me')
+        .set('Authorization', 'Bearer token-invalido')
+        .expect(401);
+    });
+
+    it('retorna o perfil do usuário autenticado quando o token é válido', async () => {
+      const accessToken = await login();
+
+      prisma.user.findUnique.mockResolvedValue({
+        id: 'user-1',
+        email: 'user@example.com',
+        passwordHash: validPasswordHash,
+        emailVerifiedAt: new Date('2026-01-01T00:00:00.000Z'),
+        createdAt: new Date('2026-01-01T00:00:00.000Z'),
+      });
+
+      const response = await request(app.getHttpServer())
+        .get('/users/me')
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(200);
+
+      expect(response.body).toMatchObject({
+        id: 'user-1',
+        email: 'user@example.com',
+      });
+      expect(response.body).not.toHaveProperty('passwordHash');
     });
   });
 });

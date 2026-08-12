@@ -1,6 +1,9 @@
-import { BadRequestException } from '@nestjs/common';
+import { UnauthorizedException, BadRequestException } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
+import { JwtService } from '@nestjs/jwt';
 import { Prisma } from '@prisma/client';
+import { hash } from 'argon2';
+import { ARGON2_OPTIONS } from '../../common/constants/argon2-options';
 import { PrismaService } from '../../prisma/prisma.service';
 import { MailService } from '../mail/mail.service';
 import { UsersService } from '../users/users.service';
@@ -15,11 +18,13 @@ describe('AuthService', () => {
       update: jest.Mock;
       create: jest.Mock;
     };
+    refreshToken: { create: jest.Mock };
     authAuditLog: { create: jest.Mock };
     $transaction: jest.Mock;
   };
   let usersService: { findByEmail: jest.Mock };
   let mailService: { sendVerificationEmail: jest.Mock };
+  let jwtService: { sign: jest.Mock };
 
   beforeEach(async () => {
     prisma = {
@@ -29,11 +34,13 @@ describe('AuthService', () => {
         update: jest.fn(),
         create: jest.fn(),
       },
+      refreshToken: { create: jest.fn() },
       authAuditLog: { create: jest.fn() },
       $transaction: jest.fn().mockResolvedValue(undefined),
     };
     usersService = { findByEmail: jest.fn() };
     mailService = { sendVerificationEmail: jest.fn() };
+    jwtService = { sign: jest.fn().mockReturnValue('signed-access-token') };
 
     const module = await Test.createTestingModule({
       providers: [
@@ -41,6 +48,7 @@ describe('AuthService', () => {
         { provide: PrismaService, useValue: prisma },
         { provide: UsersService, useValue: usersService },
         { provide: MailService, useValue: mailService },
+        { provide: JwtService, useValue: jwtService },
       ],
     }).compile();
 
@@ -129,6 +137,119 @@ describe('AuthService', () => {
       ).resolves.toBeUndefined();
 
       expect(mailService.sendVerificationEmail).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('login', () => {
+    const password = 'senha-correta-123';
+    let passwordHash: string;
+
+    beforeAll(async () => {
+      passwordHash = await hash(password, ARGON2_OPTIONS);
+    });
+
+    it('retorna access e refresh token e grava LOGIN_SUCCESS quando as credenciais são válidas', async () => {
+      usersService.findByEmail.mockResolvedValue({
+        id: 'user-1',
+        passwordHash,
+        emailVerifiedAt: new Date(),
+      });
+      prisma.refreshToken.create.mockResolvedValue({ id: 'refresh-1' });
+
+      const result = await service.login(
+        { email: 'user@example.com', password },
+        '127.0.0.1',
+        'jest',
+      );
+
+      expect(result.accessToken).toBe('signed-access-token');
+      expect(jwtService.sign).toHaveBeenCalledWith({ sub: 'user-1' });
+      expect(result.refreshToken).toMatch(/^[0-9a-f]{64}$/);
+
+      const refreshArgs = prisma.refreshToken.create.mock.calls[0][0];
+      expect(refreshArgs.data.userId).toBe('user-1');
+      expect(refreshArgs.data.tokenHash).toMatch(/^[0-9a-f]{64}$/);
+      expect(refreshArgs.data.tokenHash).not.toBe(result.refreshToken);
+
+      expect(prisma.authAuditLog.create).toHaveBeenCalledWith({
+        data: {
+          userId: 'user-1',
+          eventType: 'LOGIN_SUCCESS',
+          ip: '127.0.0.1',
+          userAgent: 'jest',
+        },
+      });
+    });
+
+    it('lança UnauthorizedException e grava LOGIN_FAILED quando o usuário não existe', async () => {
+      usersService.findByEmail.mockResolvedValue(null);
+
+      await expect(
+        service.login({ email: 'ninguem@example.com', password }),
+      ).rejects.toThrow(UnauthorizedException);
+
+      expect(prisma.refreshToken.create).not.toHaveBeenCalled();
+      expect(prisma.authAuditLog.create).toHaveBeenCalledWith({
+        data: {
+          userId: undefined,
+          eventType: 'LOGIN_FAILED',
+          ip: undefined,
+          userAgent: undefined,
+          metadata: {
+            email: 'ninguem@example.com',
+            reason: 'invalid_credentials',
+          },
+        },
+      });
+    });
+
+    it('lança UnauthorizedException e grava LOGIN_FAILED com o userId quando a senha está errada', async () => {
+      usersService.findByEmail.mockResolvedValue({
+        id: 'user-1',
+        passwordHash,
+        emailVerifiedAt: new Date(),
+      });
+
+      await expect(
+        service.login({ email: 'user@example.com', password: 'senha-errada' }),
+      ).rejects.toThrow(UnauthorizedException);
+
+      expect(prisma.refreshToken.create).not.toHaveBeenCalled();
+      expect(prisma.authAuditLog.create).toHaveBeenCalledWith({
+        data: {
+          userId: 'user-1',
+          eventType: 'LOGIN_FAILED',
+          ip: undefined,
+          userAgent: undefined,
+          metadata: {
+            email: 'user@example.com',
+            reason: 'invalid_credentials',
+          },
+        },
+      });
+    });
+
+    it('lança UnauthorizedException quando o e-mail nunca foi verificado', async () => {
+      usersService.findByEmail.mockResolvedValue({
+        id: 'user-1',
+        passwordHash,
+        emailVerifiedAt: null,
+      });
+
+      await expect(
+        service.login({ email: 'user@example.com', password }),
+      ).rejects.toThrow(UnauthorizedException);
+
+      expect(prisma.refreshToken.create).not.toHaveBeenCalled();
+      expect(prisma.authAuditLog.create).toHaveBeenCalledWith({
+        data: {
+          userId: 'user-1',
+          eventType: 'LOGIN_FAILED',
+          ip: undefined,
+          userAgent: undefined,
+          metadata: { email: 'user@example.com', reason: 'email_not_verified' },
+        },
+      });
     });
   });
 

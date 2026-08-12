@@ -18,6 +18,7 @@ const envSchema = z.object({
   SMTP_PASS: z.string().optional(),
   MAIL_FROM: z.string().email().default('noreply@auth-system.local'),
   FRONTEND_URL: z.string().url().default('http://localhost:5173'),
+  JWT_ACCESS_SECRET: z.string().min(32),
 });
 
 export type Env = z.infer<typeof envSchema>;
