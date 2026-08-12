@@ -8,11 +8,14 @@ convenção de outros projetos.
 ## Stack
 
 - Back-end: NestJS + TypeScript estrito (`apps/api`)
-- ORM: Prisma (PostgreSQL, `citext` para email) — client via driver adapter
-  (`@prisma/adapter-pg`), sem `url` no `datasource` do schema (removido a
-  partir do Prisma 6.19 em preparação pro v7); a connection string vive em
-  `prisma.config.ts` (CLI/migrate) e é injetada no `PrismaClient` via
-  `ConfigService` (runtime).
+- ORM: Prisma (PostgreSQL, `citext` para email) — padrão clássico, sem
+  adapter: `PrismaService` só estende `PrismaClient` (`src/prisma`) e lê
+  `DATABASE_URL` do ambiente via `env("DATABASE_URL")` no próprio
+  `datasource` do schema. O CLI (migrate/status) usa esse mesmo `.env` via
+  `prisma.config.ts`. Nota: a engine de validação de schema bundlada nesta
+  versão (6.19.3) já é um preview do Prisma 7, que sinaliza `url` no schema
+  como obsoleto — o aviso do editor pode ser ignorado; sem o `url` no
+  schema, os comandos de CLI quebram (testado e confirmado).
 - Front-end: React + TypeScript + Vite (`apps/web`)
 - UI: TailwindCSS v4 + shadcn/ui
 - Forms: React Hook Form + Zod

@@ -6,7 +6,8 @@ import tseslint from 'typescript-eslint';
 
 export default tseslint.config(
   {
-    ignores: ['**/eslint.config.mjs'],
+    // Scripts utilitários de CommonJS puro, fora do projeto TS de src/test.
+    ignores: ['**/eslint.config.mjs', '**/scripts/**'],
   },
   eslint.configs.recommended,
   ...tseslint.configs.recommendedTypeChecked,
