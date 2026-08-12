@@ -32,4 +32,15 @@ export class MailService implements OnModuleInit {
       html: `<p>Confirme seu cadastro clicando no link abaixo (válido por 24h):</p><p><a href="${verifyUrl}">${verifyUrl}</a></p>`,
     });
   }
+
+  async sendPasswordResetEmail(email: string, rawToken: string): Promise<void> {
+    const resetUrl = `${this.config.get<string>('FRONTEND_URL')}/reset-password?token=${rawToken}`;
+
+    await this.transporter.sendMail({
+      from: this.config.get<string>('MAIL_FROM'),
+      to: email,
+      subject: 'Redefinição de senha',
+      html: `<p>Você solicitou a redefinição de senha. O link abaixo é válido por 30 minutos:</p><p><a href="${resetUrl}">${resetUrl}</a></p><p>Se você não solicitou isso, ignore este e-mail.</p>`,
+    });
+  }
 }

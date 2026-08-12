@@ -41,10 +41,18 @@ describe('Auth + Users (e2e)', () => {
       updateMany: jest.Mock;
       findUnique: jest.Mock;
     };
+    passwordResetToken: {
+      create: jest.Mock;
+      update: jest.Mock;
+      findUnique: jest.Mock;
+    };
     authAuditLog: { create: jest.Mock };
     $transaction: jest.Mock;
   };
-  let mailService: { sendVerificationEmail: jest.Mock };
+  let mailService: {
+    sendVerificationEmail: jest.Mock;
+    sendPasswordResetEmail: jest.Mock;
+  };
   let validPasswordHash: string;
 
   beforeAll(async () => {
@@ -69,11 +77,17 @@ describe('Auth + Users (e2e)', () => {
         updateMany: jest.fn(),
         findUnique: jest.fn().mockResolvedValue(null),
       },
+      passwordResetToken: {
+        create: jest.fn().mockResolvedValue({ id: 'reset-1' }),
+        update: jest.fn(),
+        findUnique: jest.fn().mockResolvedValue(null),
+      },
       authAuditLog: { create: jest.fn() },
       $transaction: jest.fn().mockResolvedValue(undefined),
     };
     mailService = {
       sendVerificationEmail: jest.fn().mockResolvedValue(undefined),
+      sendPasswordResetEmail: jest.fn().mockResolvedValue(undefined),
     };
 
     const moduleFixture: TestingModule = await Test.createTestingModule({
@@ -354,6 +368,81 @@ describe('Auth + Users (e2e)', () => {
       await request(app.getHttpServer()).post('/auth/logout').expect(200);
 
       expect(prisma.refreshToken.update).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('/auth/forgot-password (POST)', () => {
+    it('retorna 200 com resposta genérica e envia e-mail quando o usuário existe', async () => {
+      prisma.user.findUnique.mockResolvedValue({
+        id: 'user-1',
+        email: 'user@example.com',
+      });
+
+      const response = await request(app.getHttpServer())
+        .post('/auth/forgot-password')
+        .send({ email: 'user@example.com' })
+        .expect(200);
+
+      expect(response.body).toEqual({ message: expect.any(String) });
+      expect(prisma.passwordResetToken.create).toHaveBeenCalledTimes(1);
+      expect(mailService.sendPasswordResetEmail).toHaveBeenCalledTimes(1);
+    });
+
+    it('retorna a mesma resposta genérica quando o usuário não existe, sem enviar e-mail', async () => {
+      const response = await request(app.getHttpServer())
+        .post('/auth/forgot-password')
+        .send({ email: 'ninguem@example.com' })
+        .expect(200);
+
+      expect(response.body).toEqual({ message: expect.any(String) });
+      expect(prisma.passwordResetToken.create).not.toHaveBeenCalled();
+      expect(mailService.sendPasswordResetEmail).not.toHaveBeenCalled();
+    });
+
+    it('retorna 400 quando o e-mail é inválido', async () => {
+      await request(app.getHttpServer())
+        .post('/auth/forgot-password')
+        .send({ email: 'nao-e-email' })
+        .expect(400);
+    });
+  });
+
+  describe('/auth/reset-password (POST)', () => {
+    it('retorna 200, redefine a senha e revoga as sessões quando o token é válido', async () => {
+      prisma.passwordResetToken.findUnique.mockResolvedValue({
+        id: 'reset-1',
+        userId: 'user-1',
+        usedAt: null,
+        expiresAt: new Date(Date.now() + 60_000),
+      });
+
+      const response = await request(app.getHttpServer())
+        .post('/auth/reset-password')
+        .send({ token: 'token-valido', newPassword: 'nova-senha-1234' })
+        .expect(200);
+
+      expect(response.body).toEqual({ message: expect.any(String) });
+      expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+      expect(prisma.refreshToken.updateMany).toHaveBeenCalledWith({
+        where: { userId: 'user-1', revokedAt: null },
+        data: { revokedAt: expect.any(Date) },
+      });
+    });
+
+    it('retorna 400 quando o token não existe', async () => {
+      await request(app.getHttpServer())
+        .post('/auth/reset-password')
+        .send({ token: 'inexistente', newPassword: 'nova-senha-1234' })
+        .expect(400);
+    });
+
+    it('retorna 400 quando a nova senha tem menos de 8 caracteres', async () => {
+      await request(app.getHttpServer())
+        .post('/auth/reset-password')
+        .send({ token: 'token-valido', newPassword: 'curta' })
+        .expect(400);
+
+      expect(prisma.passwordResetToken.findUnique).not.toHaveBeenCalled();
     });
   });
 

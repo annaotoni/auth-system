@@ -18,8 +18,10 @@ import {
   REFRESH_TOKEN_TTL_MS,
 } from './auth.constants';
 import { AuthService } from './auth.service';
+import { ForgotPasswordDto } from './dto/forgot-password.dto';
 import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
+import { ResetPasswordDto } from './dto/reset-password.dto';
 import { VerifyEmailDto } from './dto/verify-email.dto';
 
 @Controller('auth')
@@ -122,5 +124,33 @@ export class AuthController {
     res.clearCookie(REFRESH_TOKEN_COOKIE_NAME, { path: '/auth' });
 
     return { message: 'Logout realizado com sucesso.' };
+  }
+
+  @Post('forgot-password')
+  @HttpCode(200)
+  async forgotPassword(
+    @Body() dto: ForgotPasswordDto,
+  ): Promise<{ message: string }> {
+    await this.authService.forgotPassword(dto.email);
+    return {
+      message:
+        'Se o e-mail informado estiver cadastrado, você receberá um link para redefinir a senha.',
+    };
+  }
+
+  @Post('reset-password')
+  @HttpCode(200)
+  async resetPassword(
+    @Body() dto: ResetPasswordDto,
+    @Ip() ip: string,
+    @Headers('user-agent') userAgent?: string,
+  ): Promise<{ message: string }> {
+    await this.authService.resetPassword(
+      dto.token,
+      dto.newPassword,
+      ip,
+      userAgent,
+    );
+    return { message: 'Senha redefinida com sucesso.' };
   }
 }

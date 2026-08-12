@@ -20,6 +20,7 @@ import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
 
 const EMAIL_VERIFICATION_TTL_MS = 24 * 60 * 60 * 1000;
+const PASSWORD_RESET_TTL_MS = 30 * 60 * 1000;
 
 export interface LoginResult {
   accessToken: string;
@@ -301,6 +302,74 @@ export class AuthService {
           ip,
           userAgent,
           metadata: { familyId },
+        },
+      }),
+    ]);
+  }
+
+  async forgotPassword(email: string): Promise<void> {
+    const user = await this.usersService.findByEmail(email);
+
+    // Resposta idêntica exista ou não a conta: nenhuma ramificação aqui pode
+    // ser observada de fora.
+    if (!user) {
+      return;
+    }
+
+    const rawToken = randomBytes(32).toString('hex');
+
+    await this.prisma.passwordResetToken.create({
+      data: {
+        userId: user.id,
+        tokenHash: hashToken(rawToken),
+        expiresAt: new Date(Date.now() + PASSWORD_RESET_TTL_MS),
+      },
+    });
+
+    await this.mailService.sendPasswordResetEmail(user.email, rawToken);
+  }
+
+  async resetPassword(
+    rawToken: string,
+    newPassword: string,
+    ip?: string,
+    userAgent?: string,
+  ): Promise<void> {
+    const tokenRecord = await this.prisma.passwordResetToken.findUnique({
+      where: { tokenHash: hashToken(rawToken) },
+    });
+
+    if (
+      !tokenRecord ||
+      tokenRecord.usedAt ||
+      tokenRecord.expiresAt < new Date()
+    ) {
+      throw new BadRequestException('Token inválido ou expirado');
+    }
+
+    const passwordHash = await hash(newPassword, ARGON2_OPTIONS);
+
+    await this.prisma.$transaction([
+      this.prisma.passwordResetToken.update({
+        where: { id: tokenRecord.id },
+        data: { usedAt: new Date() },
+      }),
+      this.prisma.user.update({
+        where: { id: tokenRecord.userId },
+        data: { passwordHash },
+      }),
+      // Redefinir a senha encerra todas as sessões: se o roubo original foi
+      // da senha, refresh tokens antigos não podem sobreviver à troca.
+      this.prisma.refreshToken.updateMany({
+        where: { userId: tokenRecord.userId, revokedAt: null },
+        data: { revokedAt: new Date() },
+      }),
+      this.prisma.authAuditLog.create({
+        data: {
+          userId: tokenRecord.userId,
+          eventType: 'PASSWORD_RESET',
+          ip,
+          userAgent,
         },
       }),
     ]);
