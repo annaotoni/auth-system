@@ -408,6 +408,58 @@ describe('Auth + Users (e2e)', () => {
     });
   });
 
+  describe('/auth/resend-verification (POST)', () => {
+    it('retorna 200 e reenvia o e-mail quando a conta existe e não foi verificada', async () => {
+      prisma.user.findUnique.mockResolvedValue({
+        id: 'user-1',
+        email: 'user@example.com',
+        emailVerifiedAt: null,
+      });
+
+      const response = await request(app.getHttpServer())
+        .post('/auth/resend-verification')
+        .send({ email: 'user@example.com' })
+        .expect(200);
+
+      expect(response.body).toEqual({ message: expect.any(String) });
+      expect(prisma.emailVerificationToken.create).toHaveBeenCalledTimes(1);
+      expect(mailService.sendVerificationEmail).toHaveBeenCalledTimes(1);
+    });
+
+    it('retorna a mesma resposta genérica quando o usuário não existe', async () => {
+      const response = await request(app.getHttpServer())
+        .post('/auth/resend-verification')
+        .send({ email: 'ninguem@example.com' })
+        .expect(200);
+
+      expect(response.body).toEqual({ message: expect.any(String) });
+      expect(mailService.sendVerificationEmail).not.toHaveBeenCalled();
+    });
+
+    it('retorna a mesma resposta genérica quando o e-mail já foi verificado, sem reenviar', async () => {
+      prisma.user.findUnique.mockResolvedValue({
+        id: 'user-1',
+        email: 'user@example.com',
+        emailVerifiedAt: new Date(),
+      });
+
+      const response = await request(app.getHttpServer())
+        .post('/auth/resend-verification')
+        .send({ email: 'user@example.com' })
+        .expect(200);
+
+      expect(response.body).toEqual({ message: expect.any(String) });
+      expect(mailService.sendVerificationEmail).not.toHaveBeenCalled();
+    });
+
+    it('retorna 400 quando o e-mail é inválido', async () => {
+      await request(app.getHttpServer())
+        .post('/auth/resend-verification')
+        .send({ email: 'nao-e-email' })
+        .expect(400);
+    });
+  });
+
   describe('/auth/forgot-password (POST)', () => {
     it('retorna 200 com resposta genérica e envia e-mail quando o usuário existe', async () => {
       prisma.user.findUnique.mockResolvedValue({

@@ -129,6 +129,19 @@ export class AuthController {
     return { message: 'Logout realizado com sucesso.' };
   }
 
+  @Post('resend-verification')
+  @HttpCode(200)
+  @Throttle({ default: { limit: 3, ttl: 60_000 } })
+  async resendVerification(
+    @Body() dto: ForgotPasswordDto,
+  ): Promise<{ message: string }> {
+    await this.authService.resendVerification(dto.email);
+    return {
+      message:
+        'Se o e-mail informado tiver um cadastro pendente, você receberá um novo link de verificação.',
+    };
+  }
+
   @Post('forgot-password')
   @HttpCode(200)
   @Throttle({ default: { limit: 3, ttl: 60_000 } })

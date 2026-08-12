@@ -134,6 +134,28 @@ export class AuthService {
     ]);
   }
 
+  async resendVerification(email: string): Promise<void> {
+    const existing = await this.usersService.findByEmail(email);
+
+    // Resposta idêntica em qualquer caso (inexistente, já verificado ou
+    // reenvio de fato): nenhuma ramificação pode ser observada de fora.
+    if (!existing || existing.emailVerifiedAt) {
+      return;
+    }
+
+    const rawToken = randomBytes(32).toString('hex');
+
+    await this.prisma.emailVerificationToken.create({
+      data: {
+        userId: existing.id,
+        tokenHash: hashToken(rawToken),
+        expiresAt: new Date(Date.now() + EMAIL_VERIFICATION_TTL_MS),
+      },
+    });
+
+    await this.mailService.sendVerificationEmail(existing.email, rawToken);
+  }
+
   async login(
     dto: LoginDto,
     ip?: string,

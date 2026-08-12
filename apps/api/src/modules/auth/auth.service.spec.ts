@@ -701,4 +701,52 @@ describe('AuthService', () => {
       );
     });
   });
+
+  describe('resendVerification', () => {
+    it('emite um novo token e reenvia o e-mail quando a conta existe e não foi verificada', async () => {
+      usersService.findByEmail.mockResolvedValue({
+        id: 'user-1',
+        email: 'user@example.com',
+        emailVerifiedAt: null,
+      });
+
+      await service.resendVerification('user@example.com');
+
+      expect(prisma.emailVerificationToken.create).toHaveBeenCalledTimes(1);
+      const createArgs = prisma.emailVerificationToken.create.mock.calls[0][0];
+      expect(createArgs.data.userId).toBe('user-1');
+      expect(createArgs.data.tokenHash).toMatch(/^[0-9a-f]{64}$/);
+
+      expect(mailService.sendVerificationEmail).toHaveBeenCalledWith(
+        'user@example.com',
+        expect.any(String),
+      );
+    });
+
+    it('não faz nada quando o usuário não existe', async () => {
+      usersService.findByEmail.mockResolvedValue(null);
+
+      await expect(
+        service.resendVerification('ninguem@example.com'),
+      ).resolves.toBeUndefined();
+
+      expect(prisma.emailVerificationToken.create).not.toHaveBeenCalled();
+      expect(mailService.sendVerificationEmail).not.toHaveBeenCalled();
+    });
+
+    it('não faz nada quando o e-mail já foi verificado', async () => {
+      usersService.findByEmail.mockResolvedValue({
+        id: 'user-1',
+        email: 'user@example.com',
+        emailVerifiedAt: new Date(),
+      });
+
+      await expect(
+        service.resendVerification('user@example.com'),
+      ).resolves.toBeUndefined();
+
+      expect(prisma.emailVerificationToken.create).not.toHaveBeenCalled();
+      expect(mailService.sendVerificationEmail).not.toHaveBeenCalled();
+    });
+  });
 });
