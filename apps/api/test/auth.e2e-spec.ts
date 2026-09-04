@@ -8,6 +8,8 @@ import { App } from 'supertest/types';
 import { ARGON2_OPTIONS } from '../src/common/constants/argon2-options';
 import { AuthModule } from '../src/modules/auth/auth.module';
 import { HibpService } from '../src/modules/hibp/hibp.service';
+import { MfaService } from '../src/modules/auth/services/mfa.service';
+import { TokenBlocklistService } from '../src/modules/auth/services/token-blocklist.service';
 import { MailService } from '../src/modules/mail/mail.service';
 import { UsersModule } from '../src/modules/users/users.module';
 import { PrismaModule } from '../src/prisma/prisma.module';
@@ -111,6 +113,18 @@ describe('Auth + Users (e2e)', () => {
       .useValue(prisma)
       .overrideProvider(MailService)
       .useValue(mailService)
+      .overrideProvider(TokenBlocklistService)
+      .useValue({
+        block: jest.fn(),
+        isBlocked: jest.fn().mockResolvedValue(false),
+      })
+      .overrideProvider(MfaService)
+      .useValue({
+        generateSetup: jest.fn(),
+        verifyToken: jest.fn().mockResolvedValue(false),
+        issueChallenge: jest.fn(),
+        consumeChallenge: jest.fn().mockResolvedValue(null),
+      })
       .compile();
 
     app = moduleFixture.createNestApplication();

@@ -18,6 +18,7 @@ import { PrismaService } from '../src/prisma/prisma.service';
 const TEST_ENV = {
   JWT_ACCESS_SECRET: 'e2e-real-test-secret-com-pelo-menos-32-caracteres',
   NODE_ENV: 'test',
+  REDIS_URL: process.env.REDIS_URL ?? 'redis://localhost:6379',
 };
 
 const TEST_EMAIL = 'fluxo-critico.e2e@auth-system.local';
