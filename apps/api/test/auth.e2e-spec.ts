@@ -5,6 +5,7 @@ import { hash } from 'argon2';
 import cookieParser from 'cookie-parser';
 import request from 'supertest';
 import { App } from 'supertest/types';
+import { JwtService } from '@nestjs/jwt';
 import { ARGON2_OPTIONS } from '../src/common/constants/argon2-options';
 import { AuthModule } from '../src/modules/auth/auth.module';
 import { HibpService } from '../src/modules/hibp/hibp.service';
@@ -58,6 +59,7 @@ describe('Auth + Users (e2e)', () => {
   };
   let hibpService: { isPasswordPwned: jest.Mock };
   let validPasswordHash: string;
+  let validAccessToken: string;
 
   beforeAll(async () => {
     validPasswordHash = await hash('senha-correta-123', ARGON2_OPTIONS);
@@ -126,6 +128,12 @@ describe('Auth + Users (e2e)', () => {
         consumeChallenge: jest.fn().mockResolvedValue(null),
       })
       .compile();
+
+    const jwtService = moduleFixture.get<JwtService>(JwtService);
+    validAccessToken = jwtService.sign({
+      sub: 'user-1',
+      jti: 'test-jti-logout',
+    });
 
     app = moduleFixture.createNestApplication();
     app.use(cookieParser());
@@ -402,6 +410,7 @@ describe('Auth + Users (e2e)', () => {
 
       const response = await request(app.getHttpServer())
         .post('/auth/logout')
+        .set('Authorization', `Bearer ${validAccessToken}`)
         .set('Cookie', 'refreshToken=raw-token')
         .expect(200);
 
@@ -416,7 +425,10 @@ describe('Auth + Users (e2e)', () => {
     });
 
     it('retorna 200 mesmo sem cookie de refresh (idempotente)', async () => {
-      await request(app.getHttpServer()).post('/auth/logout').expect(200);
+      await request(app.getHttpServer())
+        .post('/auth/logout')
+        .set('Authorization', `Bearer ${validAccessToken}`)
+        .expect(200);
 
       expect(prisma.refreshToken.update).not.toHaveBeenCalled();
     });
