@@ -22,6 +22,10 @@ enum AuthEvent {
   PASSWORD_RESET
   TOKEN_REUSE_DETECTED
   EMAIL_VERIFIED
+  MFA_ENABLED
+  MFA_DISABLED
+  MFA_CHALLENGE_PASSED
+  MFA_CHALLENGE_FAILED
 }
 
 model User {
@@ -32,6 +36,8 @@ model User {
   failedLoginCount Int        @default(0) @map("failed_login_count")
   lockedUntil      DateTime?  @map("locked_until") @db.Timestamptz
   status           UserStatus @default(ACTIVE)
+  mfaEnabled       Boolean    @default(false) @map("mfa_enabled")
+  mfaSecret        String?    @map("mfa_secret")
   createdAt        DateTime   @default(now()) @map("created_at") @db.Timestamptz
   updatedAt        DateTime   @updatedAt @map("updated_at") @db.Timestamptz
 

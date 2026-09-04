@@ -1,7 +1,9 @@
 import { Module } from '@nestjs/common';
-import { ConfigModule } from '@nestjs/config';
+import { ConfigModule, ConfigService } from '@nestjs/config';
 import { APP_GUARD } from '@nestjs/core';
 import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
+import Redis from 'ioredis';
+import { ThrottlerStorageRedisService } from 'nestjs-throttler-storage-redis';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { validateEnv } from './config/env.validation';
@@ -16,7 +18,15 @@ import { PrismaModule } from './prisma/prisma.module';
     }),
     // Limite geral pra qualquer rota; endpoints sensíveis (register, login,
     // forgot-password) sobrescrevem com @Throttle() mais restritivo.
-    ThrottlerModule.forRoot([{ ttl: 60_000, limit: 60 }]),
+    ThrottlerModule.forRootAsync({
+      inject: [ConfigService],
+      useFactory: (config: ConfigService) => ({
+        throttlers: [{ ttl: 60_000, limit: 60 }],
+        storage: new ThrottlerStorageRedisService(
+          new Redis(config.getOrThrow<string>('REDIS_URL')),
+        ),
+      }),
+    }),
     PrismaModule,
     AuthModule,
   ],

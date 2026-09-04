@@ -10,10 +10,13 @@ import {
   Req,
   Res,
   UnauthorizedException,
+  UseGuards,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Throttle } from '@nestjs/throttler';
 import type { Request, Response } from 'express';
+import { CurrentUser } from '../../common/decorators/current-user.decorator';
+import type { AccessTokenPayload } from '../../common/interfaces/access-token-payload';
 import {
   REFRESH_TOKEN_COOKIE_NAME,
   REFRESH_TOKEN_TTL_MS,
@@ -24,6 +27,10 @@ import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
 import { ResetPasswordDto } from './dto/reset-password.dto';
 import { VerifyEmailDto } from './dto/verify-email.dto';
+import { MfaDisableDto } from './dto/mfa-disable.dto';
+import { MfaSetupConfirmDto } from './dto/mfa-setup-confirm.dto';
+import { MfaVerifyDto } from './dto/mfa-verify.dto';
+import { JwtAuthGuard } from './guards/jwt-auth.guard';
 
 @Controller('auth')
 export class AuthController {
@@ -54,6 +61,7 @@ export class AuthController {
   }
 
   @Get('verify')
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
   async verifyEmail(
     @Query() query: VerifyEmailDto,
     @Ip() ip: string,
@@ -71,20 +79,23 @@ export class AuthController {
     @Ip() ip: string,
     @Res({ passthrough: true }) res: Response,
     @Headers('user-agent') userAgent?: string,
-  ): Promise<{ accessToken: string }> {
-    const { accessToken, refreshToken } = await this.authService.login(
-      dto,
-      ip,
-      userAgent,
-    );
+  ): Promise<
+    { accessToken: string } | { mfaRequired: true; challengeId: string }
+  > {
+    const result = await this.authService.login(dto, ip, userAgent);
 
-    this.setRefreshCookie(res, refreshToken);
+    if (result.mfaRequired) {
+      return { mfaRequired: true, challengeId: result.challengeId! };
+    }
 
-    return { accessToken };
+    this.setRefreshCookie(res, result.refreshToken!);
+
+    return { accessToken: result.accessToken! };
   }
 
   @Post('refresh')
   @HttpCode(200)
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
   async refresh(
     @Req() req: Request,
     @Ip() ip: string,
@@ -98,30 +109,28 @@ export class AuthController {
       throw new UnauthorizedException('Refresh token ausente');
     }
 
-    const { accessToken, refreshToken } = await this.authService.refresh(
-      rawToken,
-      ip,
-      userAgent,
-    );
+    const result = await this.authService.refresh(rawToken, ip, userAgent);
 
-    this.setRefreshCookie(res, refreshToken);
+    this.setRefreshCookie(res, result.refreshToken!);
 
-    return { accessToken };
+    return { accessToken: result.accessToken! };
   }
 
   @Post('logout')
   @HttpCode(200)
+  @UseGuards(JwtAuthGuard)
   async logout(
     @Req() req: Request,
     @Ip() ip: string,
     @Res({ passthrough: true }) res: Response,
+    @CurrentUser() currentUser: AccessTokenPayload,
     @Headers('user-agent') userAgent?: string,
   ): Promise<{ message: string }> {
     const rawToken = req.cookies?.[REFRESH_TOKEN_COOKIE_NAME] as
       string | undefined;
 
     if (rawToken) {
-      await this.authService.logout(rawToken, ip, userAgent);
+      await this.authService.logout(rawToken, currentUser, ip, userAgent);
     }
 
     res.clearCookie(REFRESH_TOKEN_COOKIE_NAME, { path: '/auth' });
@@ -157,6 +166,7 @@ export class AuthController {
 
   @Post('reset-password')
   @HttpCode(200)
+  @Throttle({ default: { limit: 5, ttl: 60_000 } })
   async resetPassword(
     @Body() dto: ResetPasswordDto,
     @Ip() ip: string,
@@ -169,5 +179,57 @@ export class AuthController {
       userAgent,
     );
     return { message: 'Senha redefinida com sucesso.' };
+  }
+
+  @Post('mfa/setup')
+  @HttpCode(200)
+  @UseGuards(JwtAuthGuard)
+  async mfaSetup(
+    @CurrentUser() user: AccessTokenPayload,
+  ): Promise<{ qrCodeDataUrl: string; secret: string }> {
+    return this.authService.setupMfa(user.sub);
+  }
+
+  @Post('mfa/enable')
+  @HttpCode(200)
+  @UseGuards(JwtAuthGuard)
+  @Throttle({ default: { limit: 5, ttl: 60_000 } })
+  async mfaEnable(
+    @CurrentUser() user: AccessTokenPayload,
+    @Body() dto: MfaSetupConfirmDto,
+  ): Promise<{ message: string }> {
+    await this.authService.enableMfa(user.sub, dto.otp);
+    return { message: 'MFA ativado com sucesso.' };
+  }
+
+  @Post('mfa/disable')
+  @HttpCode(200)
+  @UseGuards(JwtAuthGuard)
+  @Throttle({ default: { limit: 5, ttl: 60_000 } })
+  async mfaDisable(
+    @CurrentUser() user: AccessTokenPayload,
+    @Body() dto: MfaDisableDto,
+  ): Promise<{ message: string }> {
+    await this.authService.disableMfa(user.sub, dto.otp);
+    return { message: 'MFA desativado.' };
+  }
+
+  @Post('mfa/verify')
+  @HttpCode(200)
+  @Throttle({ default: { limit: 5, ttl: 60_000 } })
+  async mfaVerify(
+    @Body() dto: MfaVerifyDto,
+    @Ip() ip: string,
+    @Res({ passthrough: true }) res: Response,
+    @Headers('user-agent') userAgent?: string,
+  ): Promise<{ accessToken: string }> {
+    const result = await this.authService.completeMfaLogin(
+      dto.challengeId,
+      dto.otp,
+      ip,
+      userAgent,
+    );
+    this.setRefreshCookie(res, result.refreshToken!);
+    return { accessToken: result.accessToken! };
   }
 }

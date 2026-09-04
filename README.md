@@ -26,18 +26,21 @@ Para as decisões de arquitetura e segurança por trás do código, veja o
 - Senha com Argon2id; comparação sempre feita mesmo sem usuário existente (anti-timing).
 - Access token JWT de vida curta (15 min) + refresh token opaco, hasheado no banco, em cookie `httpOnly`+`Secure`+`SameSite=Strict`.
 - Rotação de refresh token a cada uso, com detecção de reuso: token roubado reapresentado revoga a sessão inteira.
+- Revogação imediata de access token no logout via blocklist Redis por `jti` (JWT ID) — token interceptado não funciona após logout.
+- MFA com TOTP (Google Authenticator, Authy etc.) — setup, ativação e desativação por endpoint autenticado.
 - Sem enumeração de usuário: resposta e tempo de resposta genéricos em cadastro, login e recuperação de senha.
 - Rate limit por IP + lockout progressivo por conta (1 min → 5 min → 30 min → 1h → 24h).
+- Rate limit individual em todos os endpoints sensíveis: login (5/min), register (5/min), forgot-password (3/min), refresh (10/min), reset-password (5/min), verify (10/min), MFA (5/min). Contadores persistem entre restarts via Redis.
 - Verificação de e-mail obrigatória antes do login, com reenvio de link.
 - Checagem opcional de senha vazada via HIBP (k-anonymity, sem enviar a senha).
-- Log de auditoria (login, logout, reset, verificação, reuso de token) com IP e user-agent.
-- Cabeçalhos de segurança (helmet), CORS restrito por whitelist, validação de entrada em todo endpoint.
+- Log de auditoria (login, logout, reset, verificação, reuso de token, MFA) com IP e user-agent.
+- Cabeçalhos de segurança (helmet), CORS configurável por allowlist de domínios via `CORS_ORIGINS`, validação de entrada em todo endpoint.
 
 Detalhamento completo em [ARCHITECTURE.md](./ARCHITECTURE.md).
 
 ## Rodando localmente
 
-Pré-requisitos: Node 24+, Docker (para Postgres + Mailhog).
+Pré-requisitos: Node 24+, Docker (para Postgres + Redis + Mailhog).
 
 ```bash
 git clone <url-do-repositório>
@@ -79,6 +82,8 @@ Os demais valores padrão do `.env.example` já funcionam com o
 cd apps/api
 npx prisma migrate deploy
 ```
+
+> Se for a primeira vez rodando após adicionar MFA, a migration `add_mfa_fields` já está incluída.
 
 ### 4. Suba as aplicações
 
@@ -122,14 +127,14 @@ Stack sugerida, toda em camada free tier:
 | Peça                | Serviço                                                        |
 | ------------------- | -------------------------------------------------------------- |
 | Banco Postgres      | [Neon](https://neon.tech)                                      |
+| Redis               | [Upstash](https://upstash.com) (free tier)                     |
 | API (NestJS)        | [Render](https://render.com) ou [Railway](https://railway.app) |
 | Front-end (Vite)    | [Vercel](https://vercel.com)                                   |
 | E-mail transacional | [Resend](https://resend.com)                                   |
 
-> O `docker-compose.yml` também sobe um serviço Redis para desenvolvimento
-> local, mas ele não é usado pela aplicação hoje (o rate limiting roda em
-> memória — ver [ARCHITECTURE.md](./ARCHITECTURE.md#rate-limiting-e-lockout--duas-defesas-em-camadas-diferentes)).
-> Não é necessário nenhum serviço de Redis em produção para este projeto.
+> O `docker-compose.yml` sobe um serviço Redis usado pela aplicação para rate
+> limiting persistente, blocklist de access tokens e challenges de MFA. Em
+> produção, configure `REDIS_URL` com a URL do seu Redis.
 
 ### 1. Banco de dados — Neon
 
@@ -156,8 +161,9 @@ Stack sugerida, toda em camada free tier:
 2. Build command: `npm install && npx prisma generate && npm run build`.
 3. Start command: `npm run start:prod`.
 4. Configure as variáveis de ambiente (mesmas de `apps/api/.env.example`),
-   com `DATABASE_URL` do Neon, `NODE_ENV=production` e `FRONTEND_URL`
-   apontando para o domínio que o Vercel vai gerar no passo seguinte.
+   com `DATABASE_URL` do Neon, `REDIS_URL` do Upstash, `NODE_ENV=production`,
+   `FRONTEND_URL` e `CORS_ORIGINS` apontando para o domínio que o Vercel vai
+   gerar no passo seguinte.
 
 ### 4. Front-end — Vercel
 

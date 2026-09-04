@@ -13,4 +13,16 @@ export class UsersService {
   findById(id: string): Promise<User | null> {
     return this.prisma.user.findUnique({ where: { id } });
   }
+
+  findByIdWithMfa(id: string) {
+    return this.prisma.user.findUnique({
+      where: { id },
+      select: {
+        id: true,
+        email: true,
+        mfaEnabled: true,
+        mfaSecret: true,
+      },
+    });
+  }
 }
