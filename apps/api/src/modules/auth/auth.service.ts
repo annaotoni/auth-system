@@ -12,6 +12,7 @@ import {
   getDummyHash,
 } from '../../common/constants/argon2-options';
 import { hashToken } from '../../common/crypto/hash-token';
+import type { AccessTokenPayload } from '../../common/interfaces/access-token-payload';
 import { PrismaService } from '../../prisma/prisma.service';
 import { HibpService } from '../hibp/hibp.service';
 import { MailService } from '../mail/mail.service';
@@ -23,6 +24,8 @@ import {
 } from './auth.constants';
 import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
+import { MfaService } from './services/mfa.service';
+import { TokenBlocklistService } from './services/token-blocklist.service';
 
 const EMAIL_VERIFICATION_TTL_MS = 24 * 60 * 60 * 1000;
 const PASSWORD_RESET_TTL_MS = 30 * 60 * 1000;
@@ -30,8 +33,10 @@ const PWNED_PASSWORD_MESSAGE =
   'Esta senha apareceu em vazamentos de dados conhecidos. Escolha outra.';
 
 export interface LoginResult {
-  accessToken: string;
-  refreshToken: string;
+  accessToken: string | null;
+  refreshToken: string | null;
+  mfaRequired?: boolean;
+  challengeId?: string;
 }
 
 @Injectable()
@@ -42,6 +47,8 @@ export class AuthService {
     private readonly mailService: MailService,
     private readonly jwtService: JwtService,
     private readonly hibpService: HibpService,
+    private readonly tokenBlocklist: TokenBlocklistService,
+    private readonly mfaService: MfaService,
   ) {}
 
   async register(dto: RegisterDto): Promise<void> {
@@ -211,7 +218,27 @@ export class AuthService {
       });
     }
 
-    const accessToken = this.jwtService.sign({ sub: user.id });
+    if (user.mfaEnabled) {
+      await this.prisma.authAuditLog.create({
+        data: {
+          userId: user.id,
+          eventType: 'LOGIN_FAILED',
+          ip,
+          userAgent,
+          metadata: { email: dto.email, reason: 'mfa_challenge_issued' },
+        },
+      });
+      const challengeId = await this.mfaService.issueChallenge(user.id);
+      return {
+        accessToken: null,
+        refreshToken: null,
+        mfaRequired: true,
+        challengeId,
+      };
+    }
+
+    const jti = randomUUID();
+    const accessToken = this.jwtService.sign({ sub: user.id, jti });
     const rawRefreshToken = randomBytes(32).toString('hex');
 
     await this.prisma.refreshToken.create({
@@ -327,16 +354,21 @@ export class AuthService {
       }),
     ]);
 
-    const accessToken = this.jwtService.sign({ sub: tokenRecord.userId });
+    const jti = randomUUID();
+    const accessToken = this.jwtService.sign({ sub: tokenRecord.userId, jti });
 
     return { accessToken, refreshToken: rawRefreshToken };
   }
 
   async logout(
     rawToken: string,
+    currentUser: AccessTokenPayload,
     ip?: string,
     userAgent?: string,
   ): Promise<void> {
+    // Bloqueia o access token imediatamente — sem esperar expirar naturalmente.
+    await this.tokenBlocklist.block(currentUser.jti, currentUser.exp);
+
     const tokenRecord = await this.prisma.refreshToken.findUnique({
       where: { tokenHash: hashToken(rawToken) },
     });
@@ -455,5 +487,114 @@ export class AuthService {
         },
       }),
     ]);
+  }
+
+  async setupMfa(
+    userId: string,
+  ): Promise<{ qrCodeDataUrl: string; secret: string }> {
+    const user = await this.usersService.findById(userId);
+    if (!user) throw new UnauthorizedException('Usuário não encontrado');
+    if (user.mfaEnabled) throw new BadRequestException('MFA já está ativado');
+
+    const setup = await this.mfaService.generateSetup(user.email);
+
+    // Armazena o segredo provisório até a confirmação — se o usuário não confirmar,
+    // o segredo não é ativado no banco.
+    await this.prisma.user.update({
+      where: { id: userId },
+      data: { mfaSecret: setup.secret },
+    });
+
+    return { qrCodeDataUrl: setup.qrCodeDataUrl, secret: setup.secret };
+  }
+
+  async enableMfa(userId: string, otp: string): Promise<void> {
+    const user = await this.usersService.findByIdWithMfa(userId);
+    if (!user?.mfaSecret)
+      throw new BadRequestException('Execute /mfa/setup primeiro');
+    if (user.mfaEnabled) throw new BadRequestException('MFA já está ativado');
+
+    if (!(await this.mfaService.verifyToken(otp, user.mfaSecret))) {
+      throw new UnauthorizedException('OTP inválido');
+    }
+
+    await this.prisma.$transaction([
+      this.prisma.user.update({
+        where: { id: userId },
+        data: { mfaEnabled: true },
+      }),
+      this.prisma.authAuditLog.create({
+        data: { userId, eventType: 'MFA_ENABLED' },
+      }),
+    ]);
+  }
+
+  async disableMfa(userId: string, otp: string): Promise<void> {
+    const user = await this.usersService.findByIdWithMfa(userId);
+    if (!user?.mfaEnabled || !user.mfaSecret) {
+      throw new BadRequestException('MFA não está ativado');
+    }
+
+    if (!(await this.mfaService.verifyToken(otp, user.mfaSecret))) {
+      throw new UnauthorizedException('OTP inválido');
+    }
+
+    await this.prisma.$transaction([
+      this.prisma.user.update({
+        where: { id: userId },
+        data: { mfaEnabled: false, mfaSecret: null },
+      }),
+      this.prisma.authAuditLog.create({
+        data: { userId, eventType: 'MFA_DISABLED' },
+      }),
+    ]);
+  }
+
+  async completeMfaLogin(
+    challengeId: string,
+    otp: string,
+    ip?: string,
+    userAgent?: string,
+  ): Promise<LoginResult> {
+    const userId = await this.mfaService.consumeChallenge(challengeId);
+
+    if (!userId) {
+      throw new UnauthorizedException('Challenge MFA inválido ou expirado');
+    }
+
+    const user = await this.usersService.findByIdWithMfa(userId);
+
+    if (!user?.mfaEnabled || !user.mfaSecret) {
+      throw new UnauthorizedException('MFA não configurado');
+    }
+
+    if (!(await this.mfaService.verifyToken(otp, user.mfaSecret))) {
+      await this.prisma.authAuditLog.create({
+        data: { userId, eventType: 'MFA_CHALLENGE_FAILED', ip, userAgent },
+      });
+      throw new UnauthorizedException('OTP inválido');
+    }
+
+    const jti = randomUUID();
+    const accessToken = this.jwtService.sign({ sub: userId, jti });
+    const rawRefreshToken = randomBytes(32).toString('hex');
+
+    await this.prisma.$transaction([
+      this.prisma.refreshToken.create({
+        data: {
+          userId,
+          tokenHash: hashToken(rawRefreshToken),
+          familyId: randomUUID(),
+          expiresAt: new Date(Date.now() + REFRESH_TOKEN_TTL_MS),
+          ip,
+          userAgent,
+        },
+      }),
+      this.prisma.authAuditLog.create({
+        data: { userId, eventType: 'MFA_CHALLENGE_PASSED', ip, userAgent },
+      }),
+    ]);
+
+    return { accessToken, refreshToken: rawRefreshToken };
   }
 }

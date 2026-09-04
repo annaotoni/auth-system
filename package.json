@@ -26,5 +26,8 @@
     "apps/web/**/*.{ts,tsx,js,mjs}": "eslint --fix --config apps/web/eslint.config.mjs",
     "packages/shared/**/*.{ts,js,mjs}": "eslint --fix --config packages/shared/eslint.config.mjs",
     "*.{json,md,yml,yaml}": "prettier --write"
+  },
+  "dependencies": {
+    "ioredis": "^6.0.0"
   }
 }

@@ -4,11 +4,17 @@ import { JwtService } from '@nestjs/jwt';
 import { Prisma } from '@prisma/client';
 import { hash } from 'argon2';
 import { ARGON2_OPTIONS } from '../../common/constants/argon2-options';
+import type { AccessTokenPayload } from '../../common/interfaces/access-token-payload';
 import { PrismaService } from '../../prisma/prisma.service';
 import { HibpService } from '../hibp/hibp.service';
 import { MailService } from '../mail/mail.service';
 import { UsersService } from '../users/users.service';
 import { AuthService } from './auth.service';
+import { MfaService } from './services/mfa.service';
+import { TokenBlocklistService } from './services/token-blocklist.service';
+
+// Impede import do otplib (ESM-only) no ambiente CommonJS do Jest.
+jest.mock('./services/mfa.service');
 
 describe('AuthService', () => {
   let service: AuthService;
@@ -33,13 +39,24 @@ describe('AuthService', () => {
     authAuditLog: { create: jest.Mock };
     $transaction: jest.Mock;
   };
-  let usersService: { findByEmail: jest.Mock };
+  let usersService: {
+    findByEmail: jest.Mock;
+    findById: jest.Mock;
+    findByIdWithMfa: jest.Mock;
+  };
   let mailService: {
     sendVerificationEmail: jest.Mock;
     sendPasswordResetEmail: jest.Mock;
   };
   let jwtService: { sign: jest.Mock };
   let hibpService: { isPasswordPwned: jest.Mock };
+  let tokenBlocklist: { block: jest.Mock; isBlocked: jest.Mock };
+  let mfaServiceMock: {
+    generateSetup: jest.Mock;
+    verifyToken: jest.Mock;
+    issueChallenge: jest.Mock;
+    consumeChallenge: jest.Mock;
+  };
 
   beforeEach(async () => {
     prisma = {
@@ -63,13 +80,31 @@ describe('AuthService', () => {
       authAuditLog: { create: jest.fn() },
       $transaction: jest.fn().mockResolvedValue(undefined),
     };
-    usersService = { findByEmail: jest.fn() };
+    usersService = {
+      findByEmail: jest.fn(),
+      findById: jest.fn(),
+      findByIdWithMfa: jest.fn(),
+    };
     mailService = {
       sendVerificationEmail: jest.fn(),
       sendPasswordResetEmail: jest.fn(),
     };
     jwtService = { sign: jest.fn().mockReturnValue('signed-access-token') };
     hibpService = { isPasswordPwned: jest.fn().mockResolvedValue(false) };
+    tokenBlocklist = {
+      block: jest.fn().mockResolvedValue(undefined),
+      isBlocked: jest.fn().mockResolvedValue(false),
+    };
+    mfaServiceMock = {
+      generateSetup: jest.fn().mockResolvedValue({
+        secret: 'BASE32SECRET',
+        otpauthUrl: 'otpauth://totp/...',
+        qrCodeDataUrl: 'data:image/png;base64,...',
+      }),
+      verifyToken: jest.fn().mockResolvedValue(true),
+      issueChallenge: jest.fn().mockResolvedValue('challenge-uuid'),
+      consumeChallenge: jest.fn().mockResolvedValue('user-1'),
+    };
 
     const module = await Test.createTestingModule({
       providers: [
@@ -79,6 +114,8 @@ describe('AuthService', () => {
         { provide: MailService, useValue: mailService },
         { provide: JwtService, useValue: jwtService },
         { provide: HibpService, useValue: hibpService },
+        { provide: TokenBlocklistService, useValue: tokenBlocklist },
+        { provide: MfaService, useValue: mfaServiceMock },
       ],
     }).compile();
 
@@ -207,7 +244,10 @@ describe('AuthService', () => {
       );
 
       expect(result.accessToken).toBe('signed-access-token');
-      expect(jwtService.sign).toHaveBeenCalledWith({ sub: 'user-1' });
+      expect(jwtService.sign).toHaveBeenCalledWith({
+        sub: 'user-1',
+        jti: expect.any(String),
+      });
       expect(result.refreshToken).toMatch(/^[0-9a-f]{64}$/);
 
       const refreshArgs = prisma.refreshToken.create.mock.calls[0][0];
@@ -401,7 +441,10 @@ describe('AuthService', () => {
       );
 
       expect(result.accessToken).toBe('signed-access-token');
-      expect(jwtService.sign).toHaveBeenCalledWith({ sub: 'user-1' });
+      expect(jwtService.sign).toHaveBeenCalledWith({
+        sub: 'user-1',
+        jti: expect.any(String),
+      });
       expect(result.refreshToken).toMatch(/^[0-9a-f]{64}$/);
       expect(result.refreshToken).not.toBe('raw-old-token');
 
@@ -473,6 +516,13 @@ describe('AuthService', () => {
   });
 
   describe('logout', () => {
+    const fakePayload: AccessTokenPayload = {
+      sub: 'user-1',
+      jti: 'jti-test',
+      iat: 0,
+      exp: Math.floor(Date.now() / 1000) + 900,
+    };
+
     it('revoga o token e grava LOGOUT quando o token existe e não estava revogado', async () => {
       prisma.refreshToken.findUnique.mockResolvedValue({
         id: 'token-1',
@@ -480,8 +530,12 @@ describe('AuthService', () => {
         revokedAt: null,
       });
 
-      await service.logout('raw-token', '127.0.0.1', 'jest');
+      await service.logout('raw-token', fakePayload, '127.0.0.1', 'jest');
 
+      expect(tokenBlocklist.block).toHaveBeenCalledWith(
+        'jti-test',
+        fakePayload.exp,
+      );
       expect(prisma.refreshToken.update).toHaveBeenCalledWith({
         where: { id: 'token-1' },
         data: { revokedAt: expect.any(Date) },
@@ -499,7 +553,9 @@ describe('AuthService', () => {
     it('não faz nada quando o token não existe', async () => {
       prisma.refreshToken.findUnique.mockResolvedValue(null);
 
-      await expect(service.logout('inexistente')).resolves.toBeUndefined();
+      await expect(
+        service.logout('inexistente', fakePayload),
+      ).resolves.toBeUndefined();
       expect(prisma.refreshToken.update).not.toHaveBeenCalled();
       expect(prisma.authAuditLog.create).not.toHaveBeenCalled();
     });
@@ -511,7 +567,9 @@ describe('AuthService', () => {
         revokedAt: new Date(),
       });
 
-      await expect(service.logout('ja-revogado')).resolves.toBeUndefined();
+      await expect(
+        service.logout('ja-revogado', fakePayload),
+      ).resolves.toBeUndefined();
       expect(prisma.refreshToken.update).not.toHaveBeenCalled();
     });
   });
@@ -747,6 +805,207 @@ describe('AuthService', () => {
 
       expect(prisma.emailVerificationToken.create).not.toHaveBeenCalled();
       expect(mailService.sendVerificationEmail).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('setupMfa', () => {
+    it('armazena o segredo provisório e retorna qrCodeDataUrl e secret', async () => {
+      usersService.findById.mockResolvedValue({
+        id: 'user-1',
+        email: 'user@example.com',
+        mfaEnabled: false,
+      });
+      prisma.user.update.mockResolvedValue({});
+
+      const result = await service.setupMfa('user-1');
+
+      expect(result.qrCodeDataUrl).toBeTruthy();
+      expect(result.secret).toBeTruthy();
+      expect(prisma.user.update).toHaveBeenCalledWith({
+        where: { id: 'user-1' },
+        data: { mfaSecret: result.secret },
+      });
+    });
+
+    it('lança BadRequestException quando MFA já está ativado', async () => {
+      usersService.findById.mockResolvedValue({
+        id: 'user-1',
+        email: 'user@example.com',
+        mfaEnabled: true,
+      });
+
+      await expect(service.setupMfa('user-1')).rejects.toThrow(
+        BadRequestException,
+      );
+    });
+  });
+
+  describe('enableMfa', () => {
+    it('ativa MFA e grava MFA_ENABLED quando o OTP é válido', async () => {
+      usersService.findByIdWithMfa.mockResolvedValue({
+        id: 'user-1',
+        email: 'user@example.com',
+        mfaEnabled: false,
+        mfaSecret: 'BASE32SECRET',
+      });
+
+      await service.enableMfa('user-1', '123456');
+
+      expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+      expect(prisma.user.update).toHaveBeenCalledWith({
+        where: { id: 'user-1' },
+        data: { mfaEnabled: true },
+      });
+      expect(prisma.authAuditLog.create).toHaveBeenCalledWith({
+        data: { userId: 'user-1', eventType: 'MFA_ENABLED' },
+      });
+    });
+
+    it('lança UnauthorizedException quando o OTP é inválido', async () => {
+      usersService.findByIdWithMfa.mockResolvedValue({
+        id: 'user-1',
+        email: 'user@example.com',
+        mfaEnabled: false,
+        mfaSecret: 'BASE32SECRET',
+      });
+      mfaServiceMock.verifyToken.mockResolvedValueOnce(false);
+
+      await expect(service.enableMfa('user-1', 'wrong')).rejects.toThrow(
+        UnauthorizedException,
+      );
+    });
+  });
+
+  describe('disableMfa', () => {
+    it('desativa MFA e grava MFA_DISABLED quando o OTP é válido', async () => {
+      usersService.findByIdWithMfa.mockResolvedValue({
+        id: 'user-1',
+        email: 'user@example.com',
+        mfaEnabled: true,
+        mfaSecret: 'BASE32SECRET',
+      });
+
+      await service.disableMfa('user-1', '123456');
+
+      expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+      expect(prisma.user.update).toHaveBeenCalledWith({
+        where: { id: 'user-1' },
+        data: { mfaEnabled: false, mfaSecret: null },
+      });
+      expect(prisma.authAuditLog.create).toHaveBeenCalledWith({
+        data: { userId: 'user-1', eventType: 'MFA_DISABLED' },
+      });
+    });
+
+    it('lança BadRequestException quando MFA não está ativado', async () => {
+      usersService.findByIdWithMfa.mockResolvedValue({
+        id: 'user-1',
+        email: 'user@example.com',
+        mfaEnabled: false,
+        mfaSecret: null,
+      });
+
+      await expect(service.disableMfa('user-1', '123456')).rejects.toThrow(
+        BadRequestException,
+      );
+    });
+  });
+
+  describe('login com MFA habilitado', () => {
+    const password = 'senha-correta-123';
+    let passwordHash: string;
+
+    beforeAll(async () => {
+      passwordHash = await hash(password, ARGON2_OPTIONS);
+    });
+
+    it('retorna mfaRequired:true e challengeId quando o usuário tem MFA ativo', async () => {
+      usersService.findByEmail.mockResolvedValue({
+        id: 'user-mfa',
+        passwordHash,
+        emailVerifiedAt: new Date(),
+        mfaEnabled: true,
+        failedLoginCount: 0,
+        lockedUntil: null,
+      });
+
+      const result = await service.login(
+        { email: 'user@example.com', password },
+        '127.0.0.1',
+        'jest',
+      );
+
+      expect(result.mfaRequired).toBe(true);
+      expect(result.challengeId).toBeTruthy();
+      expect(result.accessToken).toBeNull();
+      expect(result.refreshToken).toBeNull();
+    });
+  });
+
+  describe('completeMfaLogin', () => {
+    it('retorna tokens e grava MFA_CHALLENGE_PASSED quando challenge e OTP são válidos', async () => {
+      usersService.findByIdWithMfa.mockResolvedValue({
+        id: 'user-1',
+        email: 'user@example.com',
+        mfaEnabled: true,
+        mfaSecret: 'BASE32SECRET',
+      });
+      prisma.refreshToken.create.mockResolvedValue({ id: 'refresh-1' });
+
+      const result = await service.completeMfaLogin(
+        'valid-challenge-id',
+        '123456',
+        '127.0.0.1',
+        'jest',
+      );
+
+      expect(result.accessToken).toBe('signed-access-token');
+      expect(result.refreshToken).toMatch(/^[0-9a-f]{64}$/);
+      expect(prisma.authAuditLog.create).toHaveBeenCalledWith({
+        data: {
+          userId: 'user-1',
+          eventType: 'MFA_CHALLENGE_PASSED',
+          ip: '127.0.0.1',
+          userAgent: 'jest',
+        },
+      });
+    });
+
+    it('lança UnauthorizedException quando o challenge é inválido ou expirado', async () => {
+      mfaServiceMock.consumeChallenge.mockResolvedValueOnce(null);
+
+      await expect(
+        service.completeMfaLogin('challenge-invalido', '123456'),
+      ).rejects.toThrow(UnauthorizedException);
+    });
+
+    it('grava MFA_CHALLENGE_FAILED e lança UnauthorizedException quando OTP está errado', async () => {
+      usersService.findByIdWithMfa.mockResolvedValue({
+        id: 'user-1',
+        email: 'user@example.com',
+        mfaEnabled: true,
+        mfaSecret: 'BASE32SECRET',
+      });
+      mfaServiceMock.consumeChallenge.mockResolvedValueOnce('user-1');
+      mfaServiceMock.verifyToken.mockResolvedValueOnce(false);
+
+      await expect(
+        service.completeMfaLogin(
+          'valid-challenge',
+          'wrong-otp',
+          '127.0.0.1',
+          'jest',
+        ),
+      ).rejects.toThrow(UnauthorizedException);
+
+      expect(prisma.authAuditLog.create).toHaveBeenCalledWith({
+        data: {
+          userId: 'user-1',
+          eventType: 'MFA_CHALLENGE_FAILED',
+          ip: '127.0.0.1',
+          userAgent: 'jest',
+        },
+      });
     });
   });
 });

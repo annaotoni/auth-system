@@ -1,4 +1,6 @@
 export const ACCESS_TOKEN_TTL = '15m';
+// Janela de tempo que o usuário tem para inserir o OTP após as credenciais.
+export const MFA_CHALLENGE_TTL_S = 5 * 60;
 export const REFRESH_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 export const REFRESH_TOKEN_COOKIE_NAME = 'refreshToken';
 

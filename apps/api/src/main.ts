@@ -12,7 +12,7 @@ async function bootstrap() {
   app.use(helmet());
   app.use(cookieParser());
   app.enableCors({
-    origin: config.getOrThrow<string>('FRONTEND_URL'),
+    origin: config.getOrThrow<string[]>('CORS_ORIGINS'),
     credentials: true,
   });
   app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true }));

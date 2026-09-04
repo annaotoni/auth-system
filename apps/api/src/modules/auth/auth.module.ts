@@ -8,6 +8,8 @@ import { UsersModule } from '../users/users.module';
 import { ACCESS_TOKEN_TTL } from './auth.constants';
 import { AuthController } from './auth.controller';
 import { AuthService } from './auth.service';
+import { MfaService } from './services/mfa.service';
+import { TokenBlocklistService } from './services/token-blocklist.service';
 import { JwtAccessStrategy } from './strategies/jwt-access.strategy';
 
 @Module({
@@ -25,6 +27,12 @@ import { JwtAccessStrategy } from './strategies/jwt-access.strategy';
     }),
   ],
   controllers: [AuthController],
-  providers: [AuthService, JwtAccessStrategy],
+  providers: [
+    AuthService,
+    JwtAccessStrategy,
+    TokenBlocklistService,
+    MfaService,
+  ],
+  exports: [TokenBlocklistService],
 })
 export class AuthModule {}
